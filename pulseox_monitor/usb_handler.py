@@ -146,19 +146,43 @@ class USBHandler(QObject):
     # =========================================================================
 
     @staticmethod
-    def available_ports() -> list[str]:
+    def check_pyserial_available() -> bool:
+        """检查 pyserial 是否已安装。
+
+        返回：
+          True 表示 pyserial 可导入，False 表示未安装。
+        """
+        try:
+            import serial  # noqa: F401
+            return True
+        except ImportError:
+            return False
+
+    @staticmethod
+    def available_ports() -> list[dict]:
         """枚举系统当前可用的 COM 口列表。
 
         返回：
-          端口名称列表，按名称排序，如 ["COM3", "COM5", "COM7"]。
-          若 pyserial 未安装或无可用端口，返回空列表。
+          端口信息列表，按 device 名称排序。
+          每项为 dict: {"device": "COM3", "description": "USB-SERIAL CH340", "hwid": "..."}
+          若 pyserial 未安装，返回空列表。
         """
         try:
             import serial.tools.list_ports as list_ports
-            ports = [p.device for p in list_ports.comports()]
-            ports.sort()
-            return ports
         except ImportError:
+            return []
+
+        try:
+            ports_info: list[dict] = []
+            for p in list_ports.comports():
+                ports_info.append({
+                    "device": p.device,
+                    "description": p.description or "",
+                    "hwid": p.hwid or "",
+                })
+            ports_info.sort(key=lambda p: p["device"])
+            return ports_info
+        except Exception:
             return []
 
     # =========================================================================

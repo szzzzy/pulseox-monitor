@@ -5,11 +5,24 @@ from __future__ import annotations
 import math
 from collections import deque
 from datetime import datetime
+from enum import Enum
 from typing import Any
 
 from PySide6.QtCore import QObject, Signal
 
 from .models import FlexibleMessage
+
+
+class DisplayMode(Enum):
+    """时间窗口显示模式。
+
+    OBSERVE — 固定采集观察窗口：[observe_start, observe_start + window]。
+    MONITOR — 实时滚动监控窗口：[now - window, now]。
+    HISTORY — 静态历史快照：[origin_time, snapshot_time]。
+    """
+    OBSERVE = "observe"
+    MONITOR = "monitor"
+    HISTORY = "history"
 
 _SENTINELS: set[str] = {"", "--", "N/A", "n/a", "NA", "na", "null", "NULL", "None"}
 _MIN_X_STEP_SECONDS = 0.001
@@ -178,19 +191,226 @@ class DataManager(QObject):
     ) -> None:
         super().__init__(parent)
         self._history: deque[FlexibleMessage] = deque(maxlen=max_history)
-        self._time_window_seconds: float | None = None
         self._available_fields: set[str] = set()
         self._origin_time: datetime = datetime.now()
-        self._switch_time: datetime | None = None
+
+        # 三模式状态
+        self._display_mode: DisplayMode = DisplayMode.MONITOR
+        self._observe_start: datetime | None = None
+        self._observe_window: float = 120.0
+        self._monitor_window: float = 120.0
+        self._history_snapshot: datetime | None = None
+        self._paused: bool = False
+
+    # ---- 属性 ----
 
     @property
     def origin_time(self) -> datetime:
-        """GUI 启动时的 PC 时间，作为 All 视图的 X 轴原点。"""
         return self._origin_time
 
+    @property
+    def display_mode(self) -> DisplayMode:
+        return self._display_mode
+
+    @property
+    def paused(self) -> bool:
+        return self._paused
+
+    # ---- 模式管理 ----
+
+    def set_display_mode(self, mode: DisplayMode) -> None:
+        """切换显示模式并初始化对应锚点。
+
+        已在目标模式时无操作（不重置锚点）。
+        Observe：记录 observe_start = PC now。
+        History：记录 history_snapshot = PC now。
+        Monitor：无需额外锚点。
+
+        参数：
+          mode: 目标显示模式。
+        """
+        if self._display_mode == mode:
+            return  # 已在目标模式，不重置锚点
+        self._display_mode = mode
+        if mode == DisplayMode.OBSERVE:
+            self._observe_start = datetime.now()
+        elif mode == DisplayMode.HISTORY:
+            self._history_snapshot = datetime.now()
+
+    def set_window_seconds(self, seconds: float) -> None:
+        """设置当前模式的窗口长度（秒）。
+
+        仅对 Observe 和 Monitor 模式生效，History 模式无窗口长度概念。
+
+        参数：
+          seconds: 窗口秒数（如 30、120、600）。
+        """
+        if self._display_mode == DisplayMode.OBSERVE:
+            self._observe_window = seconds
+        elif self._display_mode == DisplayMode.MONITOR:
+            self._monitor_window = seconds
+
+    def window_seconds(self) -> float | None:
+        """返回当前模式的窗口长度（秒）。
+
+        返回：
+          Observe/Monitor 模式返回对应窗口秒数，History 模式返回 None。
+        """
+        if self._display_mode == DisplayMode.OBSERVE:
+            return self._observe_window
+        elif self._display_mode == DisplayMode.MONITOR:
+            return self._monitor_window
+        return None
+
+    def restart_observe(self) -> None:
+        """重新开始 Observe 窗口，将 observe_start 重置为 PC now。"""
+        self._observe_start = datetime.now()
+
+    def refresh_history(self) -> None:
+        """推进 History 快照时间到 PC now，使之后到达的数据进入可见范围。"""
+        self._history_snapshot = datetime.now()
+
+    def set_paused(self, paused: bool) -> None:
+        """设置暂停状态标志。
+
+        参数：
+          paused: True 表示暂停界面刷新（不暂停底层数据接收）。
+        """
+        self._paused = paused
+
+    def observe_complete(self) -> bool:
+        """检查 Observe 窗口是否已到达结束时间。
+
+        返回：
+          True 表示当前 PC 时间已超过 observe_start + observe_window。
+          非 Observe 模式或 observe_start 未设置时返回 False。
+        """
+        if self._display_mode != DisplayMode.OBSERVE or self._observe_start is None:
+            return False
+        return datetime.now().timestamp() >= self._observe_start.timestamp() + self._observe_window
+
+    def get_state(self) -> dict[str, object]:
+        """返回当前显示状态的完整快照字典。
+
+        返回的键：
+          mode:              DisplayMode 枚举值
+          x_min / x_max:     当前 X 轴时间范围（epoch 秒）
+          visible_points:    窗口内的可见数据点数
+          buffer_points:     环形缓冲中的总数据点数
+          status:            状态文本（Live/Complete/Rolling/Static/Paused）
+          plot_time_source:  绘图时间源（固定 "PC received"）
+          device_rtc:        设备 RTC 诊断信息
+          paused:            是否暂停
+        """
+        now = datetime.now()
+        mode = self._display_mode
+        buffer_count = len(self._history)
+
+        if mode == DisplayMode.OBSERVE:
+            if self._observe_start is not None:
+                x_min = self._observe_start.timestamp()
+                x_max = x_min + self._observe_window
+                complete = self.observe_complete()
+                status = "Complete" if complete else "Live"
+            else:
+                x_min = now.timestamp()
+                x_max = x_min + self._observe_window
+                status = "Live"
+        elif mode == DisplayMode.MONITOR:
+            x_max = now.timestamp()
+            x_min = x_max - self._monitor_window
+            status = "Rolling"
+        elif mode == DisplayMode.HISTORY:
+            x_min = self._origin_time.timestamp()
+            snap = self._history_snapshot
+            if snap is not None:
+                x_max = snap.timestamp()
+                status = "Static"
+            else:
+                # 无快照（Clear 后）：显示空范围
+                x_max = x_min
+                status = "Static (empty)"
+        else:
+            x_min = self._origin_time.timestamp()
+            x_max = now.timestamp()
+            status = "Unknown"
+
+        if self._paused:
+            status = "Paused"
+
+        # 计算可见点数（窗口内的点数）
+        msgs, _ = self._windowed_messages_with_x()
+        visible = len(msgs)
+
+        # 检测时间源
+        time_source = self._detect_time_source()
+
+        return {
+            "mode": mode,
+            "x_min": x_min,
+            "x_max": x_max,
+            "visible_points": visible,
+            "buffer_points": buffer_count,
+            "status": status,
+            "plot_time_source": "PC received",
+            "device_rtc": self._device_rtc_info(),
+            "paused": self._paused,
+        }
+
+    def _detect_time_source(self) -> str:
+        """返回绘图时间源标识（固定为 "PC received"）。
+
+        设备 RTC 不参与绘图，仅通过 _device_rtc_info() 提供诊断信息。
+        """
+        return "PC received"
+
+    def _device_rtc_info(self) -> str:
+        """返回设备 RTC 诊断信息（仅用于状态栏展示，不影响绘图）。
+
+        返回：
+          "—"      — 无数据。
+          "valid (HH:MM:SS)" — 设备 RTC 有效，显示最近时间。
+          "invalid" — 设备 RTC 不可用。
+        """
+        msgs = list(self._history)
+        if not msgs:
+            return "—"
+        latest = msgs[-1]
+        if latest.timestamp_valid():
+            dt = latest.device_datetime
+            if dt:
+                return f"valid ({dt.strftime('%H:%M:%S')})"
+            return "valid"
+        if latest.device_datetime is not None:
+            return f"valid ({latest.device_datetime.strftime('%H:%M:%S')})"
+        return "invalid"
+
+    # ---- 向后兼容（旧 API，已废弃） ----
+
+    def set_time_window(self, seconds: float | None) -> None:
+        """已废弃。请使用 set_window_seconds(seconds)。
+
+        None 参数不再支持（旧 "All" 模式已移除），将被忽略。
+
+        参数：
+          seconds: 窗口秒数。传入 None 无效果。
+        """
+        if seconds is not None:
+            self.set_window_seconds(seconds)
+
+    def time_window(self) -> float | None:
+        """已废弃。请使用 window_seconds()。
+
+        返回：
+          当前模式的窗口秒数，History 模式返回 None。
+        """
+        return self.window_seconds()
+
     def set_switch_time(self, dt: datetime | None) -> None:
-        """设置时间窗口切换时刻。非 None 时仅保留该时刻之后的数据。"""
-        self._switch_time = dt
+        """已废弃。Observe/Monitor/History 模式不再使用固定锚点。
+
+        此方法为空操作，仅保留以兼容旧调用方。
+        """
 
     # ---- 环形缓冲管理 ----
 
@@ -202,14 +422,22 @@ class DataManager(QObject):
         return self._history.maxlen or 0
 
     def clear(self) -> None:
+        """清空环形缓冲并重置状态。
+
+        副作用：
+          - 清空所有历史消息和可用字段集合。
+          - 重置 origin_time = PC now。
+          - Observe 模式：重新开始 Observe（restart_observe）。
+          - History 模式：清除快照（snapshot = None），之后新数据不会自动显示。
+          - Monitor 模式：仅清空缓冲，保持 rolling 窗口。
+        """
         self._history.clear()
         self._available_fields.clear()
-
-    def set_time_window(self, seconds: float | None) -> None:
-        self._time_window_seconds = seconds
-
-    def time_window(self) -> float | None:
-        return self._time_window_seconds
+        self._origin_time = datetime.now()
+        if self._display_mode == DisplayMode.OBSERVE:
+            self._observe_start = datetime.now()
+        elif self._display_mode == DisplayMode.HISTORY:
+            self._history_snapshot = None
 
     # ---- 数据写入 ----
 
@@ -237,30 +465,73 @@ class DataManager(QObject):
         return list(self._history)
 
     # ---- 时间戳 ----
+    # PC received_at 是唯一可信 wall-clock 时间源。
+    # 设备 RTC 不参与绘图、窗口过滤和显示模式判断。
 
     def _plot_time(self, msg: FlexibleMessage) -> float:
-        return msg.plot_timestamp().timestamp()
+        """提取消息的 PC 接收时间作为绘图 X 轴时间。
+
+        参数：
+          msg: 数据消息。
+
+        返回：
+          received_at 的 epoch 秒（float）。
+        """
+        return msg.received_at.timestamp()
 
     def _series_x(self, messages: list[FlexibleMessage]) -> list[float]:
-        x = [self._plot_time(m) for m in messages]
-        if _needs_received_time_fallback(x):
-            x = [m.received_at.timestamp() for m in messages]
+        """为消息列表生成严格递增的 X 轴时间序列。
+
+        所有 X 值基于 received_at，通过 _make_strictly_increasing 处理
+        重复时间戳（插入 1ms 间隙）。
+
+        参数：
+          messages: 消息列表。
+
+        返回：
+          严格递增的 epoch 秒列表。
+        """
+        x = [m.received_at.timestamp() for m in messages]
         return _make_strictly_increasing(x)
 
     def _windowed_messages_with_x(self) -> tuple[list[FlexibleMessage], list[float]]:
+        """按当前显示模式过滤消息并生成 X 轴时间序列。
+
+        Observe：仅保留 [observe_start, observe_start + observe_window] 内的消息。
+        Monitor：仅保留 [now - monitor_window, now] 内的消息。
+        History：仅保留 [origin_time, history_snapshot] 内的消息，
+                 snapshot 为 None 时返回空。
+
+        返回：
+          (messages, x_values) 元组。无数据时返回 ([], [])。
+        """
         messages = list(self._history)
         if not messages:
             return [], []
 
         x = self._series_x(messages)
-        if self._switch_time is not None:
-            # 固定窗口模式：仅保留切换时刻之后的数据
-            cutoff = self._switch_time.timestamp()
-        elif self._time_window_seconds is None:
-            return messages, x
+
+        if self._display_mode == DisplayMode.OBSERVE:
+            if self._observe_start is None:
+                return messages, x
+            start = self._observe_start.timestamp()
+            end = start + self._observe_window
+            pairs = [(m, t) for m, t in zip(messages, x) if start <= t <= end]
+
+        elif self._display_mode == DisplayMode.MONITOR:
+            cutoff = datetime.now().timestamp() - self._monitor_window
+            pairs = [(m, t) for m, t in zip(messages, x) if t >= cutoff]
+
+        elif self._display_mode == DisplayMode.HISTORY:
+            if self._history_snapshot is None:
+                # 无快照时不显示任何数据，保持 History 静态语义
+                return [], []
+            end = self._history_snapshot.timestamp()
+            pairs = [(m, t) for m, t in zip(messages, x) if t <= end]
+
         else:
-            cutoff = datetime.now().timestamp() - self._time_window_seconds
-        pairs = [(m, t) for m, t in zip(messages, x) if t >= cutoff]
+            return messages, x
+
         if not pairs:
             return [], []
         return [m for m, _ in pairs], [t for _, t in pairs]

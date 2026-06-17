@@ -15,10 +15,17 @@ class MQTTHandler(QObject):
     upstream_payload_received = Signal(str)
     debug_message = Signal(str)
 
-    def __init__(self, upstream_topic: str, downstream_topic: str, parent: QObject | None = None) -> None:
+    def __init__(
+        self,
+        upstream_topic: str,
+        downstream_topic: str,
+        status_topic: str = "",
+        parent: QObject | None = None,
+    ) -> None:
         # 保存主题配置并初始化 MQTT 客户端状态。
         super().__init__(parent)
         self.upstream_topic = upstream_topic
+        self.status_topic = status_topic
         self.downstream_topic = downstream_topic
         self._client: mqtt.Client | None = None
         self._connected = False
@@ -136,10 +143,15 @@ class MQTTHandler(QObject):
         code = self._reason_code_to_int(reason_code)
         if code == 0:
             self._connected = True
-            self.connection_state_changed.emit(f"已连接，正在订阅 {self.upstream_topic}")
+            topics = self._subscription_topics()
+            topic_text = ", ".join(topic for topic, _qos in topics)
+            self.connection_state_changed.emit(f"已连接，正在订阅 {topic_text}")
             self.connected_changed.emit(True)
-            client.subscribe(self.upstream_topic, qos=1)
-            self.debug_message.emit(f"[MQTT] 连接成功，订阅上行主题 {self.upstream_topic}")
+            if len(topics) == 1:
+                client.subscribe(topics[0][0], qos=topics[0][1])
+            else:
+                client.subscribe(topics)
+            self.debug_message.emit(f"[MQTT] 连接成功，订阅主题 {topic_text}")
         else:
             self._connected = False
             self.connection_state_changed.emit(f"连接被拒绝，返回码: {reason_code}")
@@ -169,11 +181,20 @@ class MQTTHandler(QObject):
         self.debug_message.emit(f"[MQTT] 连接中断，paho 将自动重连: {actual_reason}")
 
     def _on_message(self, client: mqtt.Client, userdata: Any, message: mqtt.MQTTMessage) -> None:
-        # 把目标上行主题收到的文本透传给 Qt 层。
-        if message.topic != self.upstream_topic:
+        # 把数据主题和 ESP 状态主题收到的文本透传给 Qt 层。
+        if message.topic not in self._accepted_topics():
             return
         payload_text = message.payload.decode("utf-8", errors="replace")
         self.upstream_payload_received.emit(payload_text)
+
+    def _subscription_topics(self) -> list[tuple[str, int]]:
+        topics: list[tuple[str, int]] = [(self.upstream_topic, 1)]
+        if self.status_topic and self.status_topic != self.upstream_topic:
+            topics.append((self.status_topic, 1))
+        return topics
+
+    def _accepted_topics(self) -> set[str]:
+        return {topic for topic, _qos in self._subscription_topics()}
 
     def _on_subscribe(
         self,

@@ -52,7 +52,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from .data_manager import DataManager
+from .data_manager import DataManager, DisplayMode
 from .models import FlexibleMessage
 
 # =============================================================================
@@ -145,11 +145,16 @@ class PlotGroup:
         self._plots: list[pg.PlotItem] = []            # 所有子图对象
         self._curve_items: dict[str, pg.PlotDataItem] = {}   # 曲线对象 (key → curve)
         self._curve_defs: dict[str, CurveDef] = {}           # 曲线定义 (key → def)
-        self._motion_regions: list[pg.LinearRegionItem] = []  # 运动伪影叠加区域
-        self._finger_regions: list[pg.LinearRegionItem] = []  # 手指离位叠加区域
-        self._crosshair_vline: pg.InfiniteLine | None = None   # crosshair 垂直线
-        self._tooltip_label: pg.TextItem | None = None          # crosshair tooltip 文本
+        # 背景带：list[list[LinearRegionItem]] — 外层按区间，内层按 subplot
+        self._motion_regions: list[list[pg.LinearRegionItem]] = []
+        self._finger_regions: list[list[pg.LinearRegionItem]] = []
+        self._crosshair_vlines: list[pg.InfiniteLine] = []    # crosshair 垂直线（每个 subplot 独立）
+        self._tooltip_labels: list[pg.TextItem] = []          # crosshair tooltip 文本（每个 subplot 独立）
         self._active_valid_checks: dict[str, str] = {}         # 活跃的有效性检查
+        # 时间标记：list[list[InfiniteLine]] — 外层按 marker，内层按 subplot
+        self._time_markers: list[list[pg.InfiniteLine]] = []
+        # 未填充区域：每个 subplot 独立的 LinearRegionItem
+        self._unfilled_regions: list[pg.LinearRegionItem] = []
 
         # ---- 创建 GraphicsLayoutWidget 作为画布 ----
         self.widget = pg.GraphicsLayoutWidget()
@@ -214,6 +219,88 @@ class PlotGroup:
         return self._plots[0] if self._plots else None
 
     # -------------------------------------------------------------------------
+    # 时间标记线与视觉提示
+    # -------------------------------------------------------------------------
+
+    def set_time_markers(self, markers: list[dict]) -> None:
+        """设置时间标记线。每个 subplot 创建独立的 InfiniteLine item。
+
+        参数：
+          markers: 标记定义列表，每项包含：
+            position (float) — X 轴时间戳位置。
+            color (str)      — 标记线颜色（如 "#0f0"）。
+            label (str)      — 标记线标签文本。
+            style (str)      — 线型："SolidLine" / "DashLine" / "DotLine"，默认 DashLine。
+        """
+        self.clear_time_markers()
+        for mdef in markers:
+            pos = mdef["position"]
+            color = mdef.get("color", "#fff")
+            label = mdef.get("label", "")
+            style = mdef.get("style", "DashLine")
+
+            pen_style = {
+                "SolidLine": Qt.PenStyle.SolidLine,
+                "DashLine": Qt.PenStyle.DashLine,
+                "DotLine": Qt.PenStyle.DotLine,
+            }.get(style, Qt.PenStyle.DashLine)
+
+            per_plot_lines: list[pg.InfiniteLine] = []
+            for plot in self._plots:
+                line = pg.InfiniteLine(
+                    angle=90,
+                    movable=False,
+                    pen=pg.mkPen(color, width=1, style=pen_style),
+                    label=label,
+                    labelOpts={"position": 0.95, "color": color, "fill": (0, 0, 0, 150)},
+                )
+                line.setPos(pos)
+                plot.addItem(line, ignoreBounds=True)
+                per_plot_lines.append(line)
+            self._time_markers.append(per_plot_lines)
+
+    def clear_time_markers(self) -> None:
+        """清除所有时间标记线和未填充区域。"""
+        for per_plot_lines in self._time_markers:
+            for plot, line in zip(self._plots, per_plot_lines):
+                plot.removeItem(line)
+        self._time_markers.clear()
+        self._clear_unfilled_region()
+
+    def set_unfilled_region(self, start: float, end: float) -> None:
+        """设置 Observe 模式下的未填充区域（灰色半透明）。
+
+        每个 subplot 创建独立的 LinearRegionItem。
+
+        参数：
+          start: 填充数据的最晚时间（Latest 线位置）。
+          end:   窗口结束时间（End 线位置）。
+        """
+        self._clear_unfilled_region()
+        if end <= start:
+            return
+        for plot in self._plots:
+            region = pg.LinearRegionItem(
+                values=(start, end),
+                orientation=pg.LinearRegionItem.Vertical,
+                movable=False,
+                brush=pg.mkBrush(100, 100, 100, 20),
+                pen=pg.mkPen(None),
+            )
+            plot.addItem(region)
+            self._unfilled_regions.append(region)
+
+    def _clear_unfilled_region(self) -> None:
+        """清除所有 subplot 的未填充区域。"""
+        for region in self._unfilled_regions:
+            for plot in self._plots:
+                try:
+                    plot.removeItem(region)
+                except Exception:
+                    pass
+        self._unfilled_regions.clear()
+
+    # -------------------------------------------------------------------------
     # 数据刷新
     # -------------------------------------------------------------------------
 
@@ -271,16 +358,15 @@ class PlotGroup:
         运动伪影 (motion_artifact=True) → 橙色半透明背景。
         手指离位 (finger=False) → 灰色半透明背景。
 
-        遍历历史消息，检测状态变化点，构造连续区间并用 LinearRegionItem 绘制。
+        每个 subplot 创建独立的 LinearRegionItem，时间使用 PC received_at。
         """
         # 清除旧的叠加区域
-        for r in self._motion_regions + self._finger_regions:
-            for plot in self._plots:
-                plot.removeItem(r)
+        for per_plot_list in self._motion_regions + self._finger_regions:
+            for plot, region in zip(self._plots, per_plot_list):
+                plot.removeItem(region)
         self._motion_regions.clear()
         self._finger_regions.clear()
 
-        # 检查是否有子图需要运动/手指背景
         has_motion = any(s.motion_background for s in self._subplot_defs)
         has_finger = any(s.finger_background for s in self._subplot_defs)
 
@@ -291,7 +377,7 @@ class PlotGroup:
         if not messages:
             return
 
-        # ---- 计算运动伪影区间 ----
+        # ---- 计算区间（基于 PC received_at） ----
         motion_intervals: list[tuple[float, float]] = []
         finger_off_intervals: list[tuple[float, float]] = []
 
@@ -301,67 +387,64 @@ class PlotGroup:
         finger_start = 0.0
 
         for msg in messages:
-            t = msg.plot_timestamp().timestamp()
+            t = msg.received_at.timestamp()
 
-            # 检测运动伪影变化
             if has_motion:
                 mot = msg.motion_artifact
                 if mot and not in_motion:
-                    # 开始运动
                     motion_start = t
                     in_motion = True
                 elif not mot and in_motion:
-                    # 运动结束
                     motion_intervals.append((motion_start, t))
                     in_motion = False
 
-            # 检测手指在位变化
             if has_finger:
                 fng = msg.finger
                 if not fng and not in_finger_off:
-                    # 手指离开
                     finger_start = t
                     in_finger_off = True
                 elif fng and in_finger_off:
-                    # 手指重新在位
                     finger_off_intervals.append((finger_start, t))
                     in_finger_off = False
 
-        # 处理未闭合的区间（状态持续到最新消息）
         if in_motion:
             motion_intervals.append(
-                (motion_start, messages[-1].plot_timestamp().timestamp())
+                (motion_start, messages[-1].received_at.timestamp())
             )
         if in_finger_off:
             finger_off_intervals.append(
-                (finger_start, messages[-1].plot_timestamp().timestamp())
+                (finger_start, messages[-1].received_at.timestamp())
             )
 
-        # ---- 绘制运动伪影橙色背景带（应用于所有子图） ----
+        # ---- 绘制运动伪影橙色背景带（每个 subplot 独立 region） ----
         for start_t, end_t in motion_intervals:
-            region = pg.LinearRegionItem(
-                values=(start_t, end_t),
-                orientation=pg.LinearRegionItem.Vertical,
-                movable=False,
-                brush=pg.mkBrush(255, 165, 0, 30),  # 橙色，透明度 30
-                pen=pg.mkPen(None),
-            )
-            self._motion_regions.append(region)
+            per_plot: list[pg.LinearRegionItem] = []
             for plot in self._plots:
+                region = pg.LinearRegionItem(
+                    values=(start_t, end_t),
+                    orientation=pg.LinearRegionItem.Vertical,
+                    movable=False,
+                    brush=pg.mkBrush(255, 165, 0, 30),
+                    pen=pg.mkPen(None),
+                )
                 plot.addItem(region)
+                per_plot.append(region)
+            self._motion_regions.append(per_plot)
 
-        # ---- 绘制手指离位灰色背景带（应用于所有子图） ----
+        # ---- 绘制手指离位灰色背景带（每个 subplot 独立 region） ----
         for start_t, end_t in finger_off_intervals:
-            region = pg.LinearRegionItem(
-                values=(start_t, end_t),
-                orientation=pg.LinearRegionItem.Vertical,
-                movable=False,
-                brush=pg.mkBrush(128, 128, 128, 40),  # 灰色，透明度 40
-                pen=pg.mkPen(None),
-            )
-            self._finger_regions.append(region)
+            per_plot: list[pg.LinearRegionItem] = []
             for plot in self._plots:
+                region = pg.LinearRegionItem(
+                    values=(start_t, end_t),
+                    orientation=pg.LinearRegionItem.Vertical,
+                    movable=False,
+                    brush=pg.mkBrush(128, 128, 128, 40),
+                    pen=pg.mkPen(None),
+                )
                 plot.addItem(region)
+                per_plot.append(region)
+            self._finger_regions.append(per_plot)
 
     def clear(self) -> None:
         """清除所有曲线数据（保留子图框架）。"""
@@ -380,94 +463,96 @@ class PlotGroup:
     # -------------------------------------------------------------------------
 
     def _install_crosshair(self) -> None:
-        """安装跨子图的 crosshair（垂直线 + 浮动 tooltip）。
+        """安装跨子图 crosshair。每个 subplot 使用独立的 InfiniteLine 和 TextItem。
 
-        在所有子图中添加一条垂直虚线（InfiniteLine）和一个文本标签（TextItem），
-        绑定到第一个子图 scene 的鼠标移动信号，
-        实现鼠标悬停时在所有子图中显示对应 X 位置的数值。
+        共享计算逻辑（_on_mouse_moved），但每个 plot 的视觉 item 独立。
         """
-        # 垂直虚线
-        self._crosshair_vline = pg.InfiniteLine(
-            angle=90,
-            movable=False,
-            pen=pg.mkPen("w", width=1, style=Qt.PenStyle.DashLine),
-        )
-        # 浮动 tooltip 文本
-        self._tooltip_label = pg.TextItem(
-            "",
-            anchor=(0, 1),
-            color=(255, 255, 255),
-            fill=(0, 0, 0, 180),
-        )
+        for i, plot in enumerate(self._plots):
+            vline = pg.InfiniteLine(
+                angle=90,
+                movable=False,
+                pen=pg.mkPen("w", width=1, style=Qt.PenStyle.DashLine),
+            )
+            plot.addItem(vline, ignoreBounds=True)
+            self._crosshair_vlines.append(vline)
 
-        # 在所有子图中添加
-        for plot in self._plots:
-            plot.addItem(self._crosshair_vline, ignoreBounds=True)
-            plot.addItem(self._tooltip_label, ignoreBounds=True)
+            tooltip = pg.TextItem(
+                "",
+                anchor=(0, 1),
+                color=(255, 255, 255),
+                fill=(0, 0, 0, 180),
+            )
+            plot.addItem(tooltip, ignoreBounds=True)
+            self._tooltip_labels.append(tooltip)
 
-        # 绑定鼠标移动 — 使用第一个子图 scene 的信号
         if self._plots:
             self._plots[0].scene().sigMouseMoved.connect(self._on_mouse_moved)
 
     def _on_mouse_moved(self, pos) -> None:
-        """鼠标移动时更新 crosshair 位置和 tooltip 内容。
+        """鼠标移动时更新所有 subplot 的 crosshair 位置。
 
-        将 scene 坐标转换为第一个子图的视图坐标，
-        定位 crosshair 垂直线到鼠标 X 位置，
-        并收集所有曲线在附近的数值显示在 tooltip 中。
+        共享计算逻辑（坐标转换、tooltip 内容），
+        每个 subplot 的视觉 item 独立更新位置。
+
+        参数：
+          pos: 来自第一个 subplot scene 的鼠标 QPointF（scene 坐标）。
         """
-        if not self._plots or not self._crosshair_vline or not self._tooltip_label:
+        if not self._plots or not self._crosshair_vlines:
             return
 
-        # 坐标转换：scene → 视图
         view_box = self._plots[0].getViewBox()
         if view_box is None:
             return
         mouse_point = view_box.mapSceneToView(pos)
         mx = mouse_point.x()
 
-        # 移动垂直线
-        self._crosshair_vline.setPos(mx)
+        # 移动所有 subplot 的垂直线
+        for vline in self._crosshair_vlines:
+            vline.setPos(mx)
 
         # ---- 收集 tooltip 内容 ----
         tooltip_lines: list[str] = []
 
-        # 第一行：时间
         try:
             ts = datetime.fromtimestamp(mx)
             tooltip_lines.append(ts.strftime("%H:%M:%S"))
         except (ValueError, OSError):
             tooltip_lines.append(f"t={mx:.1f}")
 
-        # 后续行：各曲线在 mx 处的值
         for key, curve in self._curve_items.items():
             cdef = self._curve_defs[key]
             x_data, y_data = curve.getData()
             if x_data is None or len(x_data) == 0:
                 continue
-            # 在 X 轴数据中查找最近邻索引
             idx = _nearest_idx(x_data, mx)
             if idx < 0 or idx >= len(y_data):
                 continue
+
+            n = len(x_data)
+            if n > 1:
+                x_range = x_data[-1] - x_data[0]
+                avg_spacing = x_range / n if x_range > 0 else 1.0
+                max_dist = max(avg_spacing * 5, 2.0)
+                if abs(x_data[idx] - mx) > max_dist:
+                    continue
+
             yv = y_data[idx]
             if math.isnan(yv):
                 continue
-            # 反向缩放，显示原始值
             raw = yv / cdef.scale if cdef.scale != 1.0 else yv
             if cdef.unit:
                 tooltip_lines.append(f"{cdef.label}: {raw:.1f}{cdef.unit}")
             else:
                 tooltip_lines.append(f"{cdef.label}: {raw:.0f}")
 
-        # 显示/隐藏 tooltip
-        if len(tooltip_lines) > 1:
-            self._tooltip_label.setText("\n".join(tooltip_lines))
-            self._tooltip_label.setPos(
-                mx, self._plots[0].getViewBox().viewRange()[1][1]
-            )
-            self._tooltip_label.setVisible(True)
-        else:
-            self._tooltip_label.setVisible(False)
+        # 更新 tooltip（仅第一个 subplot 显示，其他隐藏）
+        for i, tooltip in enumerate(self._tooltip_labels):
+            if i == 0 and len(tooltip_lines) > 1:
+                tooltip.setText("\n".join(tooltip_lines))
+                tooltip.setPos(mx, self._plots[0].getViewBox().viewRange()[1][1])
+                tooltip.setVisible(True)
+            else:
+                tooltip.setVisible(False)
 
 
 def _nearest_idx(arr, target: float) -> int:
@@ -660,11 +745,15 @@ class OverviewTab(BaseTab):
 
         # ---- 顶部状态栏 ----
         top_bar = QHBoxLayout()
-        self._conn_label = QLabel("MQTT: --")
+        self._conn_label = QLabel("连接: --")
         self._conn_label.setStyleSheet("color: #888; font-size: 10pt;")
+        self._esp_status_label = QLabel("ESP32: USB 未知 | MQTT 未知")
+        self._esp_status_label.setStyleSheet("color: #888; font-size: 10pt;")
         self._time_label = QLabel("")
         self._time_label.setStyleSheet("color: #888; font-size: 10pt;")
         top_bar.addWidget(self._conn_label)
+        top_bar.addSpacing(16)
+        top_bar.addWidget(self._esp_status_label)
         top_bar.addStretch(1)
         top_bar.addWidget(self._time_label)
         main_layout.addLayout(top_bar)
@@ -739,7 +828,11 @@ class OverviewTab(BaseTab):
         参数：
           text: MQTT 连接状态描述文本。
         """
-        self._conn_label.setText(f"MQTT: {text}")
+        self._conn_label.setText(f"连接: {text}")
+
+    def set_esp_status_text(self, text: str) -> None:
+        """设置 ESP32 USB/MQTT 连接状态文本。"""
+        self._esp_status_label.setText(f"ESP32: {text}")
 
     def _safe_card(self, key: str) -> StatusCard | None:
         """安全获取卡片，KeyError 不中断 refresh。"""
@@ -759,10 +852,14 @@ class OverviewTab(BaseTab):
             self._state_label.setText("等待数据...")
             return
 
-        # ---- 状态栏：最新帧时间和 RTC 状态 ----
+        # ---- 状态栏：最新帧时间（PC received_at），RTC 仅作诊断 ----
+        rtc_diag = ""
+        if latest.device_datetime:
+            rtc_diag = f"  |  Device RTC: {latest.device_datetime.strftime('%Y-%m-%d %H:%M:%S')}"
+        else:
+            rtc_diag = "  |  Device RTC: —"
         self._state_label.setText(
-            f"最新帧: {latest.plot_timestamp().strftime('%Y-%m-%d %H:%M:%S')}  |  "
-            f"{'RTC有效' if latest.timestamp_valid() else 'RTC无效(PC时间)'}"
+            f"最新帧: {latest.received_at.strftime('%Y-%m-%d %H:%M:%S')}{rtc_diag}"
         )
 
         # ---- 更新 8 张核心指标卡片 ----
@@ -887,8 +984,8 @@ class OverviewTab(BaseTab):
         # 接收延迟
         self._rx_label.setText(f"rx_ms={latest.rx_ms}")
 
-        # 帧时间
-        self._time_label.setText(latest.plot_timestamp().strftime("%H:%M:%S"))
+        # 帧时间（PC received_at）
+        self._time_label.setText(latest.received_at.strftime("%H:%M:%S"))
 
 
 def _fmt_int(value: int | None, valid: bool) -> tuple[str, str]:
@@ -1521,6 +1618,19 @@ class DiagnosticsTab(BaseTab):
             ("rtc_read_ok", latest.get_bool("rtc_read_ok")),
             ("uart_rx_message_valid", latest.get_bool("uart_rx_message_valid")),
             ("uart_tx_message_valid", latest.get_bool("uart_tx_message_valid")),
+            # ESP32 链路状态
+            ("esp_online", latest.esp_online),
+            ("esp_usb_active", latest.esp_usb_active),
+            ("esp_usb_connected", latest.esp_usb_connected),
+            ("esp_mqtt_connected", latest.esp_mqtt_connected),
+            ("esp_mqtt_subscribed", latest.esp_mqtt_subscribed),
+            ("esp_wifi_connected", latest.esp_wifi_connected),
+            ("esp_transport_active", latest.esp_transport_active),
+            ("esp_stm32_protocol_state", latest.esp_stm32_protocol_state),
+            ("esp_stm32_last_frame", latest.esp_stm32_last_frame),
+            ("esp_stm32_last_frame_ms", latest.esp_stm32_last_frame_ms),
+            ("esp_protocol_ok_count", latest.esp_protocol_ok_count),
+            ("esp_protocol_error_count", latest.esp_protocol_error_count),
             # SD 卡（当前字段）
             ("sd_log_active", latest.get_bool("sd_log_active")),
             ("sd_state", latest.get_int("sd_state")),
@@ -1562,6 +1672,11 @@ class DiagnosticsTab(BaseTab):
             "ir_signal_delta", "ir_signal_span", "red_signal_span", "baseline_range_ir",
             "parse_ok", "rx_ms", "field_count", "schema_version", "parse_warnings",
             "extra_fields", "raw_line", "error", "set_ok", "reason",
+            "online", "transport", "usb", "wifi", "mqtt", "uart", "stm32", "counters",
+            "esp_usb_connected", "esp_usb_active", "esp_mqtt_connected",
+            "esp_mqtt_subscribed", "esp_wifi_connected", "esp_transport_active",
+            "esp_transport_mode",
+            "usb_connected", "mqtt_connected", "transport_mode", "active_transport",
             "sd_log_active", "sd_state", "sd_error", "sd_total_written",
             "display_refresh_count", "display_last_refresh_tick",
             "debug_mode", "current_page", "crash_flag", "crash_source", "reboot_count",
@@ -1644,28 +1759,19 @@ class DiagnosticsTab(BaseTab):
 class TabPlotManager(QWidget):
     """顶层 Tab 容器控件。
 
-    职责：
-      1. 创建并管理所有 Tab（Overview + 6 个图窗/诊断页）。
-      2. 提供时间窗口选择（30s / 2min / 10min / All）。
-      3. 提供暂停/恢复更新按钮。
-      4. 提供清除数据按钮。
-      5. 统一的 update_all() 入口：遍历所有 Tab 并调用 refresh()。
-
-    数据流：
-      DataManager.data_received 信号 → MainWindow._on_data_received()
-                                           └── TabPlotManager.update_all()
-                                                └── 遍历所有 Tab.refresh()
+    管理三种显示模式（Observe / Monitor / History），
+    提供模式切换工具栏、状态栏和统一的 update_all() 入口。
     """
+
+    MODE_LABELS: dict[DisplayMode, str] = {
+        DisplayMode.OBSERVE: "Observe",
+        DisplayMode.MONITOR: "Monitor",
+        DisplayMode.HISTORY: "History",
+    }
 
     def __init__(
         self, data_manager: DataManager, parent: QWidget | None = None
     ) -> None:
-        """初始化 TabPlotManager。
-
-        参数：
-          data_manager: 共享的数据管理器。
-          parent:       父控件。
-        """
         super().__init__(parent)
         self._data_manager = data_manager
         self._tabs: list[BaseTab] = []
@@ -1674,158 +1780,371 @@ class TabPlotManager(QWidget):
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(2)
 
-        # ---- 工具栏：时间窗口 + 暂停 + 清除 + 点数显示 ----
-        toolbar = QHBoxLayout()
-
-        # 时间窗口选择下拉框
-        toolbar.addWidget(QLabel("Time Window:"))
-        self._time_combo = QComboBox()
-        self._time_combo.addItems(["30 s", "2 min", "10 min", "All (buffer)"])
-        self._time_combo.currentIndexChanged.connect(self._on_time_window_changed)
-        self._time_combo.setCurrentIndex(1)  # 默认 2 分钟，触发 _on_time_window_changed
-
-        # 暂停/恢复按钮
-        self._pause_button = QPushButton("Pause")
-        self._pause_button.setCheckable(True)
-        self._pause_button.toggled.connect(self._on_pause_toggled)
-
-        # 清除按钮
-        self._clear_button = QPushButton("Clear")
-        self._clear_button.clicked.connect(self._on_clear)
-
-        toolbar.addWidget(self._time_combo)
-        toolbar.addWidget(self._pause_button)
-        toolbar.addWidget(self._clear_button)
-        toolbar.addStretch(1)
-
-        # 数据点数显示
-        self._point_count_label = QLabel("Points: 0")
-        toolbar.addWidget(self._point_count_label)
-
-        layout.addLayout(toolbar)
+        # ---- 工具栏 ----
+        layout.addLayout(self._build_toolbar())
 
         # ---- 创建所有 Tab ----
-        # 第 0 个 Tab: Overview（总览卡片页）
         self._overview_tab = OverviewTab(data_manager)
 
-        # 依次创建 6 个图窗/诊断 Tab
         tab_classes: list[type[BaseTab]] = [
-            VitalsTrendsTab,        # Tab 1: 生命体征趋势
-            SignalQualityTab,       # Tab 2: 信号质量
-            PPGRawTab,              # Tab 3: 原始 PPG
-            HRVTab,                 # Tab 4: HRV 心率变异性
-            ECGIPTTTab,             # Tab 5: ECG / PTT
-            DiagnosticsTab,         # Tab 6: 诊断页
+            VitalsTrendsTab,
+            SignalQualityTab,
+            PPGRawTab,
+            HRVTab,
+            ECGIPTTTab,
+            DiagnosticsTab,
         ]
         for tc in tab_classes:
             t = tc(data_manager)
             self._tabs.append(t)
             self._tab_widget.addTab(t, t.tab_title())
 
-        # Overview 作为第 0 个 Tab 插入（保持在最开始）
         self._tab_widget.insertTab(0, self._overview_tab, self._overview_tab.tab_title())
         self._tabs.insert(0, self._overview_tab)
 
         layout.addWidget(self._tab_widget)
 
-    def set_connection_text(self, text: str) -> None:
-        """设置 Overview Tab 中的 MQTT 连接状态文本。
+        # ---- 状态栏 ----
+        self._status_bar = QLabel()
+        self._status_bar.setStyleSheet(
+            "color: #aaa; font-size: 9pt; background: #1a1a2e;"
+            " border-top: 1px solid #333; padding: 2px 8px;"
+        )
+        layout.addWidget(self._status_bar)
 
-        由 MainWindow._set_connection_status() 调用。
+        # 初始化为默认 Monitor 模式
+        self._apply_mode(DisplayMode.MONITOR)
+
+    # -------------------------------------------------------------------------
+    # 工具栏构建
+    # -------------------------------------------------------------------------
+
+    def _build_toolbar(self) -> QHBoxLayout:
+        """构建顶部工具栏。
+
+        布局：Mode 按钮组 | Window 下拉框 | Restart | Refresh History | Pause | Clear。
+        Restart 仅在 Observe 模式下可见，Refresh History 仅在 History 模式下可见。
+        """
+        toolbar = QHBoxLayout()
+        toolbar.setSpacing(6)
+
+        # -- 模式按钮 --
+        toolbar.addWidget(QLabel("Mode:"))
+        self._mode_buttons: dict[DisplayMode, QPushButton] = {}
+        mode_group = QHBoxLayout()
+        mode_group.setSpacing(2)
+        for mode in (DisplayMode.OBSERVE, DisplayMode.MONITOR, DisplayMode.HISTORY):
+            btn = QPushButton(self.MODE_LABELS[mode])
+            btn.setCheckable(True)
+            btn.setFixedWidth(72)
+            btn.clicked.connect(lambda checked, m=mode: self._on_mode_changed(m))
+            self._mode_buttons[mode] = btn
+            mode_group.addWidget(btn)
+        toolbar.addLayout(mode_group)
+
+        toolbar.addSpacing(12)
+
+        # -- 窗口选择 --
+        toolbar.addWidget(QLabel("Window:"))
+        self._window_combo = QComboBox()
+        self._window_combo.addItems(["30 s", "2 min", "10 min"])
+        self._window_combo.setCurrentIndex(1)
+        self._window_combo.currentIndexChanged.connect(self._on_window_changed)
+        toolbar.addWidget(self._window_combo)
+
+        toolbar.addSpacing(12)
+
+        # -- 操作按钮 --
+        self._restart_button = QPushButton("Restart")
+        self._restart_button.clicked.connect(self._on_restart)
+
+        self._refresh_history_button = QPushButton("Refresh History")
+        self._refresh_history_button.clicked.connect(self._on_refresh_history)
+
+        self._pause_button = QPushButton("Pause")
+        self._pause_button.setCheckable(True)
+        self._pause_button.toggled.connect(self._on_pause_toggled)
+
+        self._clear_button = QPushButton("Clear")
+        self._clear_button.clicked.connect(self._on_clear)
+
+        toolbar.addWidget(self._restart_button)
+        toolbar.addWidget(self._refresh_history_button)
+        toolbar.addWidget(self._pause_button)
+        toolbar.addWidget(self._clear_button)
+
+        toolbar.addStretch(1)
+        return toolbar
+
+    # -------------------------------------------------------------------------
+    # 模式管理
+    # -------------------------------------------------------------------------
+
+    def _apply_mode(self, mode: DisplayMode) -> None:
+        """应用显示模式：更新按钮状态、同步下拉框、切换 DataManager、重置视图。
 
         参数：
-          text: MQTT 连接状态描述文本。
+          mode: 目标显示模式。
         """
+        for m, btn in self._mode_buttons.items():
+            btn.setChecked(m == mode)
+        self._restart_button.setVisible(mode == DisplayMode.OBSERVE)
+        self._refresh_history_button.setVisible(mode == DisplayMode.HISTORY)
+        self._data_manager.set_display_mode(mode)
+
+        # 同步下拉框到当前模式的实际窗口长度
+        window = self._data_manager.window_seconds()
+        if window is not None:
+            windows = [30, 120, 600]
+            if window in windows:
+                self._window_combo.blockSignals(True)
+                self._window_combo.setCurrentIndex(windows.index(window))
+                self._window_combo.blockSignals(False)
+
+        self._reset_views_for_mode()
+        self._refresh_all_tabs()
+        self._update_time_markers()
+        self._update_status_bar()
+
+    def _on_mode_changed(self, mode: DisplayMode) -> None:
+        """模式按钮点击回调。重复点击当前模式无操作。
+
+        参数：
+          mode: 被点击的模式按钮对应的 DisplayMode。
+        """
+        if self._data_manager.display_mode == mode:
+            return  # 重复点击当前模式，不重置
+        self._apply_mode(mode)
+
+    def _on_window_changed(self, index: int) -> None:
+        """窗口下拉框选择变化回调。
+
+        Observe 模式下切换窗口长度会重新开始 Observe。
+        Monitor/History 模式仅改变过滤范围，不清空缓冲。
+
+        参数：
+          index: 下拉框选中索引（0=30s, 1=2min, 2=10min）。
+        """
+        windows = [30, 120, 600]
+        window = windows[index]
+        self._data_manager.set_window_seconds(window)
+
+        mode = self._data_manager.display_mode
+        if mode == DisplayMode.OBSERVE:
+            self._data_manager.restart_observe()
+
+        self._reset_views_for_mode()
+        self._refresh_all_tabs()
+        self._update_time_markers()
+        self._update_status_bar()
+
+    def _on_restart(self) -> None:
+        """Restart 按钮回调。仅 Observe 模式下可见，重新开始 Observe 窗口。"""
+        self._data_manager.restart_observe()
+        self._reset_views_for_mode()
+        self._refresh_all_tabs()
+        self._update_time_markers()
+        self._update_status_bar()
+
+    def _on_refresh_history(self) -> None:
+        """Refresh History 按钮回调。仅 History 模式下可见，推进快照到当前时刻。"""
+        self._data_manager.refresh_history()
+        self._reset_views_for_mode()
+        self._refresh_all_tabs()
+        self._update_time_markers()
+        self._update_status_bar()
+
+    def _on_pause_toggled(self, checked: bool) -> None:
+        """Pause 按钮切换回调。暂停/恢复界面刷新，不暂停底层数据接收。
+
+        参数：
+          checked: True 表示暂停，False 表示恢复。
+        """
+        self._data_manager.set_paused(checked)
+        self._pause_button.setText("Resume" if checked else "Pause")
+        self._update_status_bar()
+
+    def _on_clear(self) -> None:
+        """Clear 按钮回调。清空所有数据和图表，重置视图。
+
+        Observe 下会重新开始 Observe 窗口。
+        History 下会清除快照（新数据不会自动显示）。
+        Monitor 下仅清空缓冲，保持 rolling 窗口。
+        """
+        self._data_manager.clear()
+        for tab in self._tabs:
+            if hasattr(tab, '_plot_group') and tab._plot_group:
+                tab._plot_group.clear()
+                tab._plot_group.clear_time_markers()
+            tab.refresh()
+        self._reset_views_for_mode()
+        self._update_time_markers()
+        self._update_status_bar()
+
+    # -------------------------------------------------------------------------
+    # 公共接口
+    # -------------------------------------------------------------------------
+
+    def set_connection_text(self, text: str) -> None:
         if self._overview_tab:
             self._overview_tab.set_connection_text(text)
 
-    def update_all(self) -> None:
-        """刷新所有 Tab 的显示。
+    def set_esp_status_text(self, text: str) -> None:
+        if self._overview_tab:
+            self._overview_tab.set_esp_status_text(text)
 
-        若暂停按钮被选中，跳过刷新（冻结显示）。
-        刷新后更新右上角的点数统计。
-        All 视图时同步刷新 X 轴右边界。
+    def update_all(self) -> None:
+        """统一刷新入口（由 DataManager.data_received 信号驱动）。
+
+        暂停时仅更新状态栏，不刷新图表。
+        History 模式仅更新状态栏，不自动追新数据（需手动 Refresh History）。
+        Observe 模式刷新曲线并更新标记，但不改变 X 轴范围。
+        Monitor 模式刷新曲线并更新滚动 X 轴范围。
         """
         if self._pause_button.isChecked():
+            self._update_status_bar()
             return
-        for tab in self._tabs:
-            tab.refresh()
-        self._point_count_label.setText(f"Points: {len(self._data_manager)}")
-        # All 视图：右侧随新数据动态增长
-        if self._data_manager.time_window() is None:
-            now = datetime.now().timestamp()
-            origin = self._data_manager.origin_time.timestamp()
-            for tab in self._tabs:
-                pg = getattr(tab, '_plot_group', None)
-                if pg is not None:
-                    pg.reset_views(x_min=origin, x_max=now)
+
+        mode = self._data_manager.display_mode
+
+        if mode == DisplayMode.HISTORY:
+            self._update_status_bar()
+            return
+
+        if mode == DisplayMode.OBSERVE:
+            self._refresh_all_tabs()
+            self._update_time_markers()
+            self._update_status_bar()
+            return
+
+        # MONITOR: rolling window
+        self._refresh_all_tabs()
+        self._update_monitor_x_range()
+        self._update_status_bar()
 
     def as_widget(self) -> QWidget:
         """返回自身作为 QWidget（兼容旧接口）。"""
         return self
 
     # -------------------------------------------------------------------------
-    # 工具栏按钮回调
+    # X 轴与视图管理
     # -------------------------------------------------------------------------
 
-    def _on_time_window_changed(self, index: int) -> None:
-        """时间窗口下拉框选择变化时的回调。
+    def _reset_views_for_mode(self) -> None:
+        """根据当前模式重置所有 PlotGroup 的 X/Y 视图范围。
 
-        将选择映射为秒数，传入 DataManager.set_time_window()。
-        窗口选项: [30s, 120s, 600s, None(All)]。
-
-        参数：
-          index: 下拉框选中的索引（0-3）。
+        调用 plot_group.reset_views() 执行 autoRange Y + setXRange X。
+        仅在模式切换、Restart、Refresh History、Clear、窗口长度变更时调用。
         """
-        windows = [30, 120, 600, None]
-        window = windows[index]
-        self._data_manager.set_time_window(window)
-        now = datetime.now()
-        if window is not None:
-            # 固定窗口：左侧锚定切换时刻，右侧 = 切换时刻 + 窗口
-            self._data_manager.set_switch_time(now)
-            x_min = now.timestamp()
-            x_max = x_min + window
-        else:
-            # All：从启动原点到现在，右侧可随新数据增长
-            self._data_manager.set_switch_time(None)
-            x_min = self._data_manager.origin_time.timestamp()
-            x_max = now.timestamp()
-        # 先刷新曲线数据（应用新时间窗口过滤），再重置视图
-        if not self._pause_button.isChecked():
-            for tab in self._tabs:
-                tab.refresh()
+        state = self._data_manager.get_state()
+        x_min = float(state["x_min"])
+        x_max = float(state["x_max"])
         for tab in self._tabs:
             pg = getattr(tab, '_plot_group', None)
             if pg is not None:
                 pg.reset_views(x_min=x_min, x_max=x_max)
 
-    def _on_pause_toggled(self, checked: bool) -> None:
-        """暂停/恢复按钮切换时的回调。
+    def _update_monitor_x_range(self) -> None:
+        """更新 Monitor 模式的滚动 X 轴范围（仅 setXRange，不做 autoRange Y）。
 
-        - 选中（checked=True）：按钮文本变为 "Resume"，
-          此时 update_all() 被阻止，图表冻结不动。
-        - 取消（checked=False）：按钮文本恢复 "Pause"，
-          恢复正常实时刷新。
-
-        参数：
-          checked: 按钮是否被选中。
+        每帧在 update_all() 中调用，保持 [now - window, now] 的滚动窗口。
         """
-        self._pause_button.setText("Resume" if checked else "Pause")
-
-    def _on_clear(self) -> None:
-        """清除所有历史数据并重置图表。
-
-        调用 DataManager.clear() 清空环形缓冲，
-        然后清空所有 PlotGroup 的曲线数据，
-        最后刷新所有 Tab 显示空状态。
-        """
-        self._data_manager.clear()
+        now = datetime.now().timestamp()
+        window = self._data_manager.window_seconds() or 120
+        x_min = now - window
+        x_max = now
         for tab in self._tabs:
-            if hasattr(tab, '_plot_group') and tab._plot_group:
-                tab._plot_group.clear()
+            pg = getattr(tab, '_plot_group', None)
+            if pg is not None and pg.first_plot is not None:
+                pg.first_plot.setXRange(x_min, x_max, padding=0.0)
+
+    # -------------------------------------------------------------------------
+    # 内部辅助
+    # -------------------------------------------------------------------------
+
+    def _refresh_all_tabs(self) -> None:
+        """遍历所有 Tab 并调用各自的 refresh() 方法。"""
+        for tab in self._tabs:
             tab.refresh()
+
+    def _update_time_markers(self) -> None:
+        """根据当前模式设置各 PlotGroup 的时间标记线和未填充区域。
+
+        Observe：Start（绿虚线）、End（红虚线）、Latest（白点线）+ 灰色未填充区域。
+        Monitor：Now（青虚线）。
+        History：Origin（灰点线）、Snapshot（橙实线）。
+        """
+        """根据当前模式设置各 PlotGroup 的时间标记线。"""
+        state = self._data_manager.get_state()
+        mode = self._data_manager.display_mode
+        now = datetime.now().timestamp()
+
+        for tab in self._tabs:
+            pg = getattr(tab, '_plot_group', None)
+            if pg is None:
+                continue
+
+            markers: list[dict] = []
+
+            if mode == DisplayMode.OBSERVE:
+                x_min = float(state["x_min"])
+                x_max = float(state["x_max"])
+                markers.append({"position": x_min, "color": "#0f0", "label": "Start", "style": "DashLine"})
+                markers.append({"position": x_max, "color": "#f00", "label": "End", "style": "DashLine"})
+                # 最新数据线（基于 PC received_at）
+                msgs = self._data_manager.messages()
+                if msgs:
+                    latest_t = msgs[-1].received_at.timestamp()
+                    if x_min <= latest_t <= x_max:
+                        markers.append({"position": latest_t, "color": "#fff", "label": "Latest", "style": "DotLine"})
+                # 未填充区域
+                if msgs:
+                    latest_t = msgs[-1].received_at.timestamp()
+                    if latest_t < x_max:
+                        pg.set_unfilled_region(latest_t, x_max)
+
+            elif mode == DisplayMode.MONITOR:
+                markers.append({"position": now, "color": "#0ff", "label": "Now", "style": "DashLine"})
+
+            elif mode == DisplayMode.HISTORY:
+                x_min = float(state["x_min"])
+                x_max = float(state["x_max"])
+                markers.append({"position": x_min, "color": "#888", "label": "Origin", "style": "DotLine"})
+                markers.append({"position": x_max, "color": "#f80", "label": "Snapshot", "style": "SolidLine"})
+
+            pg.set_time_markers(markers)
+
+    def _update_status_bar(self) -> None:
+        """更新底部状态栏，显示 Mode / Range / Visible / Buffer / Status / Plot time / Device RTC。"""
+        state = self._data_manager.get_state()
+        mode_label = self.MODE_LABELS.get(state["mode"], "?")
+
+        x_min = float(state["x_min"])
+        x_max = float(state["x_max"])
+        try:
+            t_min = datetime.fromtimestamp(x_min).strftime("%H:%M:%S")
+            t_max = datetime.fromtimestamp(x_max).strftime("%H:%M:%S")
+            range_text = f"{t_min} — {t_max}"
+        except (ValueError, OSError):
+            range_text = f"{x_min:.0f} — {x_max:.0f}"
+
+        visible = state["visible_points"]
+        buffer_pts = state["buffer_points"]
+        status = state["status"]
+        device_rtc = state.get("device_rtc", "—")
+
+        parts = [
+            f"Mode: {mode_label}",
+            f"Range: {range_text}",
+            f"Visible: {visible}",
+            f"Buffer: {buffer_pts}",
+            f"Status: {status}",
+            f"Plot time: PC received",
+            f"Device RTC: {device_rtc}",
+        ]
+        self._status_bar.setText("  |  ".join(parts))
 
 
 # =============================================================================

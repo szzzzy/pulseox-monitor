@@ -99,6 +99,34 @@ def _safe_bool(value: Any, default: bool = False) -> bool:
     return default
 
 
+def _safe_optional_bool(value: Any) -> bool | None:
+    """安全地将任意值转换为三态布尔值。
+
+    返回 True / False / None，None 表示字段缺失或无法判断。
+    用于 ESP32 连接状态这类诊断字段，避免把未知状态误显示为断开。
+    """
+    value = _clean_value(value)
+    if value is None:
+        return None
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, int) and value in (0, 1):
+        return bool(value)
+    if isinstance(value, str):
+        normalized = value.strip().lower().replace("-", "_").replace(" ", "_")
+        if normalized in {
+            "true", "1", "yes", "y", "on", "connected", "connect",
+            "online", "ready", "up", "ok",
+        }:
+            return True
+        if normalized in {
+            "false", "0", "no", "n", "off", "disconnected", "disconnect",
+            "offline", "not_connected", "down", "fail", "failed",
+        }:
+            return False
+    return None
+
+
 def _safe_int(value: Any) -> int | None:
     """安全地将任意值转换为 int 类型。
 
@@ -327,6 +355,15 @@ class FlexibleMessage:
         """
         return _safe_bool(self.get(*path), default=default)
 
+    def get_optional_bool(self, *path: str) -> bool | None:
+        """按嵌套路径获取值并安全转换为三态 bool。
+
+        返回 True / False / None。None 表示路径不存在或值无法判断。
+        """
+        if not self.has(*path):
+            return None
+        return _safe_optional_bool(self.get(*path))
+
     def get_int(self, *path: str, default: int | None = None) -> int | None:
         """按嵌套路径获取值并安全转换为 int。
 
@@ -381,6 +418,24 @@ class FlexibleMessage:
             else:
                 return False
         return True
+
+    def _first_optional_bool(self, paths: tuple[tuple[str, ...], ...]) -> bool | None:
+        """按候选路径顺序返回第一个可判断的三态布尔值。"""
+        for path in paths:
+            value = self.get_optional_bool(*path)
+            if value is not None:
+                return value
+        return None
+
+    def _first_str(self, paths: tuple[tuple[str, ...], ...]) -> str | None:
+        """按候选路径顺序返回第一个非空字符串值。"""
+        for path in paths:
+            if not self.has(*path):
+                continue
+            value = self.get_str(*path)
+            if value:
+                return value
+        return None
 
     # =========================================================================
     # modules 子对象快捷访问
@@ -586,6 +641,170 @@ class FlexibleMessage:
         None = 字段缺失（旧固件），True = 有信号，False = 无信号。
         """
         return self.get("raw_signal_present")
+
+    # =========================================================================
+    # 顶层属性 —— ESP32 状态上报（esp-status-v1）
+    # =========================================================================
+
+    @property
+    def esp_online(self) -> bool | None:
+        """ESP32 状态消息中的 online 字段。
+
+        None 表示尚未上报或无法判断。GUI 还会结合 lastEspStatusAt 做超时判定。
+        """
+        return self._first_optional_bool((("online",), ("esp", "online")))
+
+    @property
+    def esp_usb_active(self) -> bool | None:
+        """ESP32 USB 会话是否 active。
+
+        新协议优先使用 usb.active；兼容 transport.usb_active 与旧字段。
+        """
+        return self._first_optional_bool((
+            ("usb", "active"),
+            ("transport", "usb_active"),
+            ("esp_usb_active",),
+            ("usb_active",),
+            ("esp_status", "usb", "active"),
+            ("esp_status", "transport", "usb_active"),
+        ))
+
+    @property
+    def esp_usb_connected(self) -> bool | None:
+        """ESP32 USB 物理连接/线缆连接状态。
+
+        新协议优先使用 usb.connected；兼容 transport.usb_connected 与旧字段。
+        """
+        return self._first_optional_bool((
+            ("usb", "connected"),
+            ("transport", "usb_connected"),
+            ("esp_usb_connected",),
+            ("usb_connected",),
+            ("usb_online",),
+            ("usb_ready",),
+            ("usb",),
+            ("usb", "is_connected"),
+            ("usb", "online"),
+            ("usb", "ready"),
+            ("esp", "usb_connected"),
+            ("esp", "usb_online"),
+            ("esp", "usb", "connected"),
+            ("esp", "usb", "online"),
+            ("esp_status", "usb_connected"),
+            ("esp_status", "usb_online"),
+            ("esp_status", "usb", "connected"),
+            ("esp_status", "usb", "online"),
+            ("connections", "usb"),
+            ("connections", "usb_connected"),
+            ("transport_status", "usb"),
+            ("transport_status", "usb_connected"),
+        ))
+
+    @property
+    def esp_mqtt_connected(self) -> bool | None:
+        """ESP32 MQTT 连接状态。新协议优先使用 mqtt.connected。"""
+        return self._first_optional_bool((
+            ("mqtt", "connected"),
+            ("transport", "mqtt_connected"),
+            ("esp_mqtt_connected",),
+            ("mqtt_connected",),
+            ("mqtt_online",),
+            ("mqtt_ready",),
+            ("mqtt",),
+            ("mqtt", "is_connected"),
+            ("mqtt", "online"),
+            ("mqtt", "ready"),
+            ("esp", "mqtt_connected"),
+            ("esp", "mqtt_online"),
+            ("esp", "mqtt", "connected"),
+            ("esp", "mqtt", "online"),
+            ("esp_status", "mqtt_connected"),
+            ("esp_status", "mqtt_online"),
+            ("esp_status", "mqtt", "connected"),
+            ("esp_status", "mqtt", "online"),
+            ("connections", "mqtt"),
+            ("connections", "mqtt_connected"),
+            ("transport_status", "mqtt"),
+            ("transport_status", "mqtt_connected"),
+        ))
+
+    @property
+    def esp_mqtt_subscribed(self) -> bool | None:
+        """ESP32 是否已订阅 MQTT 命令主题。"""
+        return self._first_optional_bool((
+            ("mqtt", "subscribed"),
+            ("transport", "mqtt_subscribed"),
+            ("esp_mqtt_subscribed",),
+            ("mqtt_subscribed",),
+        ))
+
+    @property
+    def esp_wifi_connected(self) -> bool | None:
+        """ESP32 WiFi 连接状态。"""
+        return self._first_optional_bool((
+            ("wifi", "connected"),
+            ("esp_wifi_connected",),
+            ("wifi_connected",),
+        ))
+
+    @property
+    def esp_transport_active(self) -> str | None:
+        """ESP32 当前上行通道：usb / mqtt / usb_idle / offline 等。"""
+        return self._first_str((
+            ("transport", "active"),
+            ("esp_transport_active",),
+            ("transport_active",),
+            ("esp_transport_mode",),
+            ("transport_mode",),
+            ("active_transport",),
+            ("activeTransport",),
+            ("selected_transport",),
+            ("selectedTransport",),
+            ("link_mode",),
+            ("esp", "transport_mode"),
+            ("esp", "active_transport"),
+            ("esp_status", "transport", "active"),
+            ("esp_status", "transport_mode"),
+            ("esp_status", "active_transport"),
+        ))
+
+    @property
+    def esp_transport_mode(self) -> str | None:
+        """向后兼容属性：返回当前上行通道的大写规范化文本。"""
+        value = self.esp_transport_active
+        if not value:
+            return None
+        normalized = value.strip().upper().replace("-", "_").replace(" ", "_")
+        if normalized in {"MQTT", "WIFI_MQTT"}:
+            return "MQTT"
+        if normalized in {"USB", "SERIAL", "UART", "USB_SERIAL"}:
+            return "USB"
+        return normalized
+
+    @property
+    def esp_stm32_protocol_state(self) -> str | None:
+        """STM32/协议状态，例如 ok/error。"""
+        return self.get_str("stm32", "protocol_state")
+
+    @property
+    def esp_stm32_last_frame(self) -> str | None:
+        """STM32 最近帧类型。"""
+        return self.get_str("stm32", "last_frame")
+
+    @property
+    def esp_stm32_last_frame_ms(self) -> int | None:
+        """STM32 最近帧时间戳（ESP uptime ms）。"""
+        return self.get_int("stm32", "last_frame_ms")
+
+    @property
+    def esp_protocol_ok_count(self) -> int | None:
+        """ESP32 协议解析成功计数。"""
+        return self.get_int("counters", "protocol_ok")
+
+    @property
+    def esp_protocol_error_count(self) -> int | None:
+        """ESP32 协议解析错误计数。"""
+        return self.get_int("counters", "protocol_error")
 
     # =========================================================================
     # 顶层属性 —— ECG 相关（当前 102 列 schema，列 72-77）
@@ -1149,4 +1368,21 @@ KNOWN_FIELD_PATHS: list[tuple[str, str]] = [
     ("parse_ok", "Parse OK"),
     ("field_count", "Field Count"),
     ("rx_ms", "RX ms"),
+
+    # ---- ESP32 链路状态 ----
+    ("online", "ESP Online"),
+    ("transport.active", "ESP Active Transport"),
+    ("usb.active", "ESP USB Session Active"),
+    ("usb.connected", "ESP USB Physical Connected"),
+    ("mqtt.connected", "ESP MQTT Connected"),
+    ("mqtt.subscribed", "ESP MQTT Subscribed"),
+    ("wifi.connected", "ESP WiFi Connected"),
+    ("stm32.protocol_state", "STM32 Protocol State"),
+    ("stm32.last_frame", "STM32 Last Frame"),
+    ("stm32.last_frame_ms", "STM32 Last Frame ms"),
+    ("counters.protocol_ok", "Protocol OK Count"),
+    ("counters.protocol_error", "Protocol Error Count"),
+    ("esp_usb_connected", "ESP USB Connected"),
+    ("esp_mqtt_connected", "ESP MQTT Connected"),
+    ("esp_transport_mode", "ESP Transport Mode"),
 ]

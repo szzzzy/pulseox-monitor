@@ -9,7 +9,7 @@
 - 使用 `MessageDispatcher` 按 JSON 字段 `message` 路由为三类类型化消息：`measurement`、`rtc_set_ack`、`parse_error`。
 - 只有 `measurement` 会进入 `DataManager` 的环形缓存，并驱动 IR / Red / BPM / SpO2 四条曲线。
 - 设备时间会在内部解析为 `datetime`；若 `rtc_valid=false`，则保留样本但绘图回退到 PC 接收时间，同时在状态面板中标明 RTC 无效。
-- “时间同步”按钮会向 `pulseox/cmd` 发布纯文本命令：`T,YYYYMMDD,HHMMSS`。
+- “时间同步”按钮会向 `pulseox/cmd` 发布纯文本命令：`SETTIME YYYY-MM-DD HH:MM:SS`。
 - `rtc_set_ack` 更新状态面板，`parse_error` 进入调试日志面板。
 - `MQTTHandler` 提供自动重连和错误日志，便于在 Broker 重启或网络短暂波动时恢复。
 - `BrokerManager` 支持检测本地 Broker、按配置启动 Mosquitto，并在应用退出时清理由本应用拉起的进程。
@@ -79,7 +79,7 @@ D:\MOSQUITTO\my_mosquitto.conf
 - 上行主题：`pulseox/data`
 - 下行主题：`pulseox/cmd`
 - 支持的上行 `message` 类型：`measurement`、`rtc_set_ack`、`parse_error`
-- RTC 同步命令格式：`T,YYYYMMDD,HHMMSS`
+- RTC 同步命令格式：`SETTIME YYYY-MM-DD HH:MM:SS`
 
 ## 测试
 
