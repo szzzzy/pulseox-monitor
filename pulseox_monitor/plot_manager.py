@@ -55,6 +55,9 @@ from PySide6.QtWidgets import (
 from .data_manager import DataManager, DisplayMode
 from .models import FlexibleMessage
 
+# ---- 时间窗口预设（秒） ----
+DEFAULT_TIME_WINDOWS = [30, 120, 600]
+
 # =============================================================================
 # CurveDef —— 单条曲线的配置定义
 # =============================================================================
@@ -145,6 +148,7 @@ class PlotGroup:
         self._plots: list[pg.PlotItem] = []            # 所有子图对象
         self._curve_items: dict[str, pg.PlotDataItem] = {}   # 曲线对象 (key → curve)
         self._curve_defs: dict[str, CurveDef] = {}           # 曲线定义 (key → def)
+        self._subplot_curve_keys: list[list[str]] = []        # 每个 subplot 对应的曲线 key
         # 背景带：list[list[LinearRegionItem]] — 外层按区间，内层按 subplot
         self._motion_regions: list[list[pg.LinearRegionItem]] = []
         self._finger_regions: list[list[pg.LinearRegionItem]] = []
@@ -191,6 +195,7 @@ class PlotGroup:
                 plot.hideAxis("bottom")
 
             # ---- 在此子图中创建曲线 ----
+            subplot_curve_keys: list[str] = []
             for cdef in sub_def.curves:
                 pen = pg.mkPen(color=cdef.color, width=cdef.width)
                 if cdef.dashed:
@@ -201,9 +206,11 @@ class PlotGroup:
                 key = f"{sub_def.title}/{cdef.field_path}"
                 self._curve_items[key] = curve
                 self._curve_defs[key] = cdef
+                subplot_curve_keys.append(key)
                 if cdef.valid_check:
                     self._active_valid_checks[key] = cdef.valid_check
 
+            self._subplot_curve_keys.append(subplot_curve_keys)
             self._plots.append(plot)
 
         # 在最后一个子图底部显示 X 轴标签
@@ -296,8 +303,8 @@ class PlotGroup:
             for plot in self._plots:
                 try:
                     plot.removeItem(region)
-                except Exception:
-                    pass
+                except RuntimeError:
+                    pass  # item already removed or not owned by this plot
         self._unfilled_regions.clear()
 
     # -------------------------------------------------------------------------
@@ -323,8 +330,49 @@ class PlotGroup:
             # 根据有效性更新曲线样式
             self._update_curve_style(key, x, y, valid_mask)
 
+        self._update_y_ranges()
+
         # 更新背景带（运动伪影、手指离位）
         self._update_background_bands()
+
+    def _update_y_ranges(self) -> None:
+        """Fit every subplot's Y axis to the currently visible curve data."""
+        for plot, sub_def, curve_keys in zip(
+            self._plots, self._subplot_defs, self._subplot_curve_keys
+        ):
+            values: list[float] = []
+            for key in curve_keys:
+                curve = self._curve_items.get(key)
+                if curve is None:
+                    continue
+                _, y_data = curve.getData()
+                if y_data is None:
+                    continue
+                for value in y_data:
+                    try:
+                        y = float(value)
+                    except (TypeError, ValueError):
+                        continue
+                    if math.isfinite(y):
+                        values.append(y)
+
+            if not values:
+                if sub_def.y_range:
+                    plot.setYRange(*sub_def.y_range, padding=0.05)
+                continue
+
+            y_min = min(values)
+            y_max = max(values)
+            if sub_def.y_range:
+                y_min = min(y_min, sub_def.y_range[0])
+                y_max = max(y_max, sub_def.y_range[1])
+
+            if y_min == y_max:
+                delta = max(abs(y_min) * 0.05, 1.0)
+                y_min -= delta
+                y_max += delta
+
+            plot.setYRange(y_min, y_max, padding=0.05)
 
     def _update_curve_style(
         self, key: str, x: list[float], y: list[float], valid: list[bool]
@@ -388,9 +436,10 @@ class PlotGroup:
 
         for msg in messages:
             t = msg.received_at.timestamp()
+            schema_issue = msg.detect_schema_issue() is not None
 
             if has_motion:
-                mot = msg.motion_artifact
+                mot = False if schema_issue else msg.motion_artifact
                 if mot and not in_motion:
                     motion_start = t
                     in_motion = True
@@ -399,11 +448,11 @@ class PlotGroup:
                     in_motion = False
 
             if has_finger:
-                fng = msg.finger
-                if not fng and not in_finger_off:
+                fng = None if schema_issue else msg.get_optional_bool("finger")
+                if fng is False and not in_finger_off:
                     finger_start = t
                     in_finger_off = True
-                elif fng and in_finger_off:
+                elif fng is True and in_finger_off:
                     finger_off_intervals.append((finger_start, t))
                     in_finger_off = False
 
@@ -702,6 +751,11 @@ class BaseTab(QWidget):
         """返回此 Tab 的标签文本。"""
         return self._title
 
+    @property
+    def plot_group(self):
+        """返回此 Tab 的 PlotGroup 实例，无绘图组时返回 None。"""
+        return getattr(self, '_plot_group', None)
+
     def refresh(self) -> None:
         """从 DataManager 读取最新数据并刷新显示。
 
@@ -758,7 +812,7 @@ class OverviewTab(BaseTab):
         top_bar.addWidget(self._time_label)
         main_layout.addLayout(top_bar)
 
-        # ---- 核心生命体征卡片网格（2 行 × 4 列） ----
+        # ---- 核心生命体征卡片网格（3 行 × 4 列） ----
         vital_grid = QGridLayout()
         vital_grid.setSpacing(10)
 
@@ -769,11 +823,16 @@ class OverviewTab(BaseTab):
             ("SpO2", "%", "spo2", 0, 1),
             ("RR", "次/分", "rr", 0, 2),
             ("IBI", "ms", "ibi", 0, 3),
-            # 第二行：信号质量 / ECG / PTT
-            ("SQ", "0-100", "signal_quality", 1, 0),
-            ("Motion", "", "motion", 1, 1),
-            ("ECG HR", "bpm", "ecg_hr", 1, 2),
-            ("PTT", "ms", "ptt_ms", 1, 3),
+            # 第二行：HRV + 信号质量
+            ("Mean IBI", "ms", "mean_ibi", 1, 0),
+            ("SDNN", "ms", "sdnn", 1, 1),
+            ("RMSSD", "ms", "rmssd", 1, 2),
+            ("SQ", "0-100", "signal_quality", 1, 3),
+            # 第三行：运动 / ECG / PTT
+            ("Motion", "", "motion", 2, 0),
+            ("ECG HR", "bpm", "ecg_hr", 2, 1),
+            ("ECG RR", "ms", "ecg_rr_ms", 2, 2),
+            ("PTT", "ms", "ptt_ms", 2, 3),
         ]
 
         for title, unit, key, row, col in card_defs:
@@ -843,7 +902,7 @@ class OverviewTab(BaseTab):
 
         处理逻辑：
           1. 若无数据，显示 "等待数据..."。
-          2. 更新 8 张核心指标卡片。
+          2. 更新核心指标卡片。
           3. 更新传感器状态（手指在位、原始信号、导联、心律）。
           4. 更新解析状态（含 schema 版本检测和警告）。
         """
@@ -862,7 +921,9 @@ class OverviewTab(BaseTab):
             f"最新帧: {latest.received_at.strftime('%Y-%m-%d %H:%M:%S')}{rtc_diag}"
         )
 
-        # ---- 更新 8 张核心指标卡片 ----
+        schema_issue = latest.detect_schema_issue()
+
+        # ---- 更新核心指标卡片 ----
         # 使用 _safe_card 防护：单个卡片 key 配置错误不会中断整体刷新。
 
         if (card := self._safe_card("bpm")) is not None:
@@ -881,11 +942,33 @@ class OverviewTab(BaseTab):
             ibi_v, ibi_s = _fmt_int(latest.ibi, latest.ibi_valid)
             card.update_value(ibi_v, latest.ibi_valid, ibi_s)
 
+        hrv_status = "schema" if schema_issue else ""
+        if (card := self._safe_card("mean_ibi")) is not None:
+            hrv_v, hrv_s = _fmt_int(
+                None if schema_issue else latest.mean_ibi,
+                latest.hrv_valid and not schema_issue,
+            )
+            card.update_value(hrv_v, latest.hrv_valid and not schema_issue, hrv_status or hrv_s)
+
+        if (card := self._safe_card("sdnn")) is not None:
+            sdnn_v, sdnn_s = _fmt_int(
+                None if schema_issue else latest.sdnn,
+                latest.hrv_valid and not schema_issue,
+            )
+            card.update_value(sdnn_v, latest.hrv_valid and not schema_issue, hrv_status or sdnn_s)
+
+        if (card := self._safe_card("rmssd")) is not None:
+            rmssd_v, rmssd_s = _fmt_int(
+                None if schema_issue else latest.rmssd,
+                latest.hrv_valid and not schema_issue,
+            )
+            card.update_value(rmssd_v, latest.hrv_valid and not schema_issue, hrv_status or rmssd_s)
+
         if (card := self._safe_card("signal_quality")) is not None:
-            sq = latest.signal_quality
+            sq = None if schema_issue else latest.signal_quality
             sq_v = str(sq) if sq is not None else "--"
-            sq_valid = sq is not None and sq > 0
-            card.update_value(sq_v, sq_valid)
+            sq_valid = sq is not None and sq > 0 and not schema_issue
+            card.update_value(sq_v, sq_valid, "schema" if schema_issue else "")
 
         if (card := self._safe_card("motion")) is not None:
             mot = latest.motion_artifact
@@ -894,21 +977,38 @@ class OverviewTab(BaseTab):
             card.update_value(mot_v, True, "运动干扰" if mot else "")
 
         if (card := self._safe_card("ecg_hr")) is not None:
-            ecg_v, ecg_s = _fmt_int(latest.ecg_hr, latest.ecg_valid)
-            card.update_value(ecg_v, latest.ecg_valid, ecg_s)
+            ecg_v, ecg_s = _fmt_int(
+                None if schema_issue else latest.ecg_hr,
+                latest.ecg_valid and not schema_issue,
+            )
+            card.update_value(ecg_v, latest.ecg_valid and not schema_issue, "schema" if schema_issue else ecg_s)
+
+        if (card := self._safe_card("ecg_rr_ms")) is not None:
+            ecg_rr_v, ecg_rr_s = _fmt_int(
+                None if schema_issue else latest.ecg_rr_ms,
+                latest.ecg_valid and not schema_issue,
+            )
+            card.update_value(ecg_rr_v, latest.ecg_valid and not schema_issue, "schema" if schema_issue else ecg_rr_s)
 
         if (card := self._safe_card("ptt_ms")) is not None:
-            ptt_v, ptt_s = _fmt_int(latest.ptt_ms, latest.ptt_valid)
-            card.update_value(ptt_v, latest.ptt_valid, ptt_s)
+            ptt_v, ptt_s = _fmt_int(
+                None if schema_issue else latest.ptt_ms,
+                latest.ptt_valid and not schema_issue,
+            )
+            card.update_value(ptt_v, latest.ptt_valid and not schema_issue, "schema" if schema_issue else ptt_s)
 
         # ---- 传感器状态 ----
 
         # 手指在位
-        fng = latest.finger
-        self._finger_label.setText(f"Finger: {'在位' if fng else '离位'}")
-        self._finger_label.setStyleSheet(
-            f"color: {'#0f0' if fng else '#f00'}; font-size: 10pt;"
-        )
+        fng = latest.get_optional_bool("finger")
+        if fng is None:
+            self._finger_label.setText("Finger: --")
+            self._finger_label.setStyleSheet("color: #888; font-size: 10pt;")
+        else:
+            self._finger_label.setText(f"Finger: {'在位' if fng else '离位'}")
+            self._finger_label.setStyleSheet(
+                f"color: {'#0f0' if fng else '#f00'}; font-size: 10pt;"
+            )
 
         # 原始信号
         rs = latest.raw_signal_present
@@ -943,7 +1043,6 @@ class OverviewTab(BaseTab):
             self._rhythm_label.setStyleSheet("color: #0f0; font-size: 10pt;")
 
         # ---- 解析状态（含 Schema 检测） ----
-        schema_issue = latest.detect_schema_issue()
         protocol = latest.protocol or "json"
         schema_ver = latest.schema_version or "?"
         self._parse_label.setText(
@@ -1434,7 +1533,7 @@ class DiagnosticsTab(BaseTab):
     布局（自上而下，用 QSplitter 分隔）：
       1. 解析状态标签（message_type, parse_ok, protocol, schema, field_count, rx_ms）
       2. 传感器诊断表（Sensor Diagnostics）
-      3. 系统诊断表（System Diagnostics —— 当前 102 字段 schema）
+      3. 系统诊断表（System Diagnostics —— 当前 110 字段 schema）
       4. 额外/未知字段表（Extra / Unknown Fields）
       5. 解析警告文本框（Parse Warnings）
       6. 原始帧文本框（Raw Frame —— STM32 CSV 行）
@@ -1446,6 +1545,7 @@ class DiagnosticsTab(BaseTab):
     ) -> None:
         """初始化诊断 Tab。"""
         super().__init__(data_manager, "Diagnostics", parent)
+        self._latest_esp_status: FlexibleMessage | None = None
         # 子控件引用
         self._sensor_table: QTableWidget | None = None
         self._system_table: QTableWidget | None = None
@@ -1482,7 +1582,7 @@ class DiagnosticsTab(BaseTab):
         sensor_layout.addWidget(self._sensor_table)
         splitter.addWidget(sensor_group)
 
-        # ---- 系统诊断表（当前 102 字段 schema） ----
+        # ---- 系统诊断表（当前 110 字段 schema） ----
         sys_group = QGroupBox("System Diagnostics")
         sys_layout = QVBoxLayout(sys_group)
         self._system_table = QTableWidget(0, 2)
@@ -1553,13 +1653,17 @@ class DiagnosticsTab(BaseTab):
 
         layout.addWidget(splitter)
 
+    def set_esp_status_message(self, message: FlexibleMessage) -> None:
+        self._latest_esp_status = message
+        self.refresh()
+
     def refresh(self) -> None:
         """从 DataManager 读取最新消息并刷新所有诊断视图。
 
         刷新内容：
           1. 解析状态标签（含 Schema 检测结果）。
           2. 传感器诊断表（14 个 I2C/FIFO/采样 相关字段）。
-          3. 系统诊断表（当前 102 字段 schema：RTC/UART/SD/Display/System/Finger）。
+          3. 系统诊断表（当前 110 字段 schema：RTC/UART/SD/Display/System/Finger）。
           4. 额外/未知字段表（不在已知字段集合中的字段 + extra_fields 列表项）。
           5. 解析警告文本框（设备端报告的 parse_warnings 详情）。
           6. 原始帧文本框（STM32 CSV 原始行）。
@@ -1567,7 +1671,10 @@ class DiagnosticsTab(BaseTab):
         """
         latest = self._data_manager.latest()
         if latest is None:
+            latest = self._latest_esp_status
+        if latest is None:
             return
+        esp_status = self._latest_esp_status or latest
 
         # ---- 解析状态标签 ----
         schema_ver = latest.schema_version or "?"
@@ -1612,27 +1719,33 @@ class DiagnosticsTab(BaseTab):
             ("sensor_last_i2c_error", latest.get_int("sensor_last_i2c_error")),
         ])
 
-        # ---- 系统诊断表（当前 102 字段 schema） ----
+        # ---- 系统诊断表（当前 110 字段 schema） ----
         self._populate_table(self._system_table, [
+            # 解析上下文
+            ("raw_line", latest.raw_line),
+            ("extra_fields", latest.extra_fields),
+            ("parse_warnings", latest.parse_warnings),
             # RTC / UART 状态
-            ("rtc_read_ok", latest.get_bool("rtc_read_ok")),
-            ("uart_rx_message_valid", latest.get_bool("uart_rx_message_valid")),
-            ("uart_tx_message_valid", latest.get_bool("uart_tx_message_valid")),
+            ("rtc_read_ok", latest.get_optional_bool("rtc_read_ok")),
+            ("uart_rx_message_valid", latest.get_optional_bool("uart_rx_message_valid")),
+            ("uart_tx_message_valid", latest.get_optional_bool("uart_tx_message_valid")),
             # ESP32 链路状态
-            ("esp_online", latest.esp_online),
-            ("esp_usb_active", latest.esp_usb_active),
-            ("esp_usb_connected", latest.esp_usb_connected),
-            ("esp_mqtt_connected", latest.esp_mqtt_connected),
-            ("esp_mqtt_subscribed", latest.esp_mqtt_subscribed),
-            ("esp_wifi_connected", latest.esp_wifi_connected),
-            ("esp_transport_active", latest.esp_transport_active),
-            ("esp_stm32_protocol_state", latest.esp_stm32_protocol_state),
-            ("esp_stm32_last_frame", latest.esp_stm32_last_frame),
-            ("esp_stm32_last_frame_ms", latest.esp_stm32_last_frame_ms),
-            ("esp_protocol_ok_count", latest.esp_protocol_ok_count),
-            ("esp_protocol_error_count", latest.esp_protocol_error_count),
+            ("esp_online", esp_status.esp_online),
+            ("esp_usb_active", esp_status.esp_usb_active),
+            ("esp_usb_connected", esp_status.esp_usb_connected),
+            ("esp_mqtt_connected", esp_status.esp_mqtt_connected),
+            ("esp_mqtt_subscribed", esp_status.esp_mqtt_subscribed),
+            ("esp_wifi_connected", esp_status.esp_wifi_connected),
+            ("esp_transport_active", esp_status.esp_transport_active),
+            ("esp_stm32_protocol_state", esp_status.esp_stm32_protocol_state),
+            ("esp_stm32_last_frame", esp_status.esp_stm32_last_frame),
+            ("esp_stm32_last_frame_ms", esp_status.esp_stm32_last_frame_ms),
+            ("protocol_ok", esp_status.esp_protocol_ok_count),
+            ("protocol_error", esp_status.esp_protocol_error_count),
+            ("esp_protocol_ok_count", esp_status.esp_protocol_ok_count),
+            ("esp_protocol_error_count", esp_status.esp_protocol_error_count),
             # SD 卡（当前字段）
-            ("sd_log_active", latest.get_bool("sd_log_active")),
+            ("sd_log_active", latest.get_optional_bool("sd_log_active")),
             ("sd_state", latest.get_int("sd_state")),
             ("sd_error", latest.get_int("sd_error")),
             ("sd_total_written", latest.get_int("sd_total_written")),
@@ -1640,17 +1753,41 @@ class DiagnosticsTab(BaseTab):
             ("display_refresh_count", latest.get_int("display_refresh_count")),
             ("display_last_refresh_tick", latest.get_int("display_last_refresh_tick")),
             # 系统状态
-            ("debug_mode", latest.get_bool("debug_mode")),
+            ("debug_mode", latest.get_optional_bool("debug_mode")),
             ("current_page", latest.get_int("current_page")),
-            ("crash_flag", latest.get_bool("crash_flag")),
+            ("crash_flag", latest.get_optional_bool("crash_flag")),
             ("crash_source", latest.get_int("crash_source")),
+            ("crash_task", latest.crash_task),
+            ("crash_phase", latest.crash_phase),
+            ("crash_tick", latest.crash_tick),
             ("reboot_count", latest.get_int("reboot_count")),
+            ("reset_flags", latest.reset_flags),
+            # 任务阶段 / 栈 / 心跳（当前 110 字段 schema）
+            ("max_task_phase", latest.max_task_phase),
+            ("ui_task_phase", latest.ui_task_phase),
+            ("sd_task_phase", latest.sd_task_phase),
+            ("wdt_task_phase", latest.wdt_task_phase),
+            ("max_task_stack_hwm", latest.max_task_stack_hwm),
+            ("ui_task_stack_hwm", latest.ui_task_stack_hwm),
+            ("sd_task_stack_hwm", latest.sd_task_stack_hwm),
+            ("wdt_task_stack_hwm", latest.wdt_task_stack_hwm),
+            ("max_task_heartbeat", latest.max_task_heartbeat),
+            ("ui_task_heartbeat", latest.ui_task_heartbeat),
             # 手指检测统计
             ("finger_on_confirm_count", latest.get_int("finger_on_confirm_count")),
             ("finger_off_confirm_count", latest.get_int("finger_off_confirm_count")),
             ("adaptive_finger_on_delta", latest.get_int("adaptive_finger_on_delta")),
             ("adaptive_finger_off_delta", latest.get_int("adaptive_finger_off_delta")),
             ("spo2_balance_status", latest.get_int("spo2_balance_status")),
+            # ECG 质量字段（v3 新增，列 102-109）
+            ("ecg_signal_quality", latest.ecg_signal_quality),
+            ("ecg_invalid_reason", latest.ecg_invalid_reason),
+            ("ecg_raw_span", latest.ecg_raw_span),
+            ("ecg_filtered_span", latest.ecg_filtered_span),
+            ("ecg_noise_level", latest.ecg_noise_level),
+            ("ecg_qrs_threshold", latest.ecg_qrs_threshold),
+            ("ecg_peak_snr_x100", latest.ecg_peak_snr_x100),
+            ("ecg_dma_available_high_watermark", latest.ecg_dma_available_high_watermark),
         ])
 
         # ---- 额外/未知字段表 ----
@@ -1675,11 +1812,18 @@ class DiagnosticsTab(BaseTab):
             "online", "transport", "usb", "wifi", "mqtt", "uart", "stm32", "counters",
             "esp_usb_connected", "esp_usb_active", "esp_mqtt_connected",
             "esp_mqtt_subscribed", "esp_wifi_connected", "esp_transport_active",
-            "esp_transport_mode",
+            "esp_transport_mode", "esp_stm32_protocol_state",
+            "esp_stm32_last_frame", "esp_stm32_last_frame_ms",
+            "protocol_ok", "protocol_error", "esp_protocol_ok_count",
+            "esp_protocol_error_count",
             "usb_connected", "mqtt_connected", "transport_mode", "active_transport",
             "sd_log_active", "sd_state", "sd_error", "sd_total_written",
             "display_refresh_count", "display_last_refresh_tick",
-            "debug_mode", "current_page", "crash_flag", "crash_source", "reboot_count",
+            "debug_mode", "current_page", "crash_flag", "crash_source",
+            "crash_task", "crash_phase", "crash_tick", "reboot_count", "reset_flags",
+            "max_task_phase", "ui_task_phase", "sd_task_phase", "wdt_task_phase",
+            "max_task_stack_hwm", "ui_task_stack_hwm", "sd_task_stack_hwm",
+            "wdt_task_stack_hwm", "max_task_heartbeat", "ui_task_heartbeat",
             "rtc_read_ok", "uart_rx_message_valid", "uart_tx_message_valid",
             "sensor_last_read_status", "sensor_error_streak", "sensor_fifo_write_ptr",
             "sensor_fifo_read_ptr", "sensor_fifo_overflow_count",
@@ -1689,7 +1833,11 @@ class DiagnosticsTab(BaseTab):
             "sensor_sample_change_count", "sensor_sample_same_count",
             "sensor_last_i2c_error", "finger_on_confirm_count",
             "finger_off_confirm_count", "adaptive_finger_on_delta",
-            "adaptive_finger_off_delta", "modules", "data",
+            "adaptive_finger_off_delta",
+            "ecg_signal_quality", "ecg_invalid_reason", "ecg_raw_span",
+            "ecg_filtered_span", "ecg_noise_level", "ecg_qrs_threshold",
+            "ecg_peak_snr_x100", "ecg_dma_available_high_watermark",
+            "modules", "data",
         }
 
         # 收集 raw 字典中不在已知集合中的键
@@ -1723,10 +1871,12 @@ class DiagnosticsTab(BaseTab):
 
         # ---- 解析警告详情 ----
         if self._warnings_view:
-            if warnings:
-                self._warnings_view.setPlainText(
-                    "\n".join(str(w) for w in warnings)
-                )
+            warning_lines = []
+            if schema_issue:
+                warning_lines.append(f"SCHEMA: {schema_issue}")
+            warning_lines.extend(str(w) for w in warnings)
+            if warning_lines:
+                self._warnings_view.setPlainText("\n".join(warning_lines))
             else:
                 self._warnings_view.setPlainText("")
 
@@ -1736,7 +1886,7 @@ class DiagnosticsTab(BaseTab):
         """填充诊断表格。
 
         将 (键名, 值) 列表写入表格控件。
-        值为 None 的行被过滤掉（不显示缺失的字段）。
+        值为 None 的行显示为 "--"，确保当前 schema 字段名始终可见。
 
         参数：
           table: 目标表格控件。
@@ -1744,12 +1894,25 @@ class DiagnosticsTab(BaseTab):
         """
         if table is None:
             return
-        # 过滤掉值为 None 的行
-        filtered = [(k, v) for k, v in rows if v is not None]
-        table.setRowCount(len(filtered))
-        for i, (key, value) in enumerate(filtered):
+        table.setRowCount(len(rows))
+        for i, (key, value) in enumerate(rows):
             table.setItem(i, 0, QTableWidgetItem(key))
-            table.setItem(i, 1, QTableWidgetItem(str(value)))
+            table.setItem(i, 1, QTableWidgetItem(_format_diag_value(value)))
+
+
+def _format_diag_value(value: Any) -> str:
+    """诊断表显示值，缺失用 --，复杂值紧凑 JSON 化。"""
+    if value is None:
+        return "--"
+    if isinstance(value, list) and not value:
+        return "--"
+    if isinstance(value, (dict, list, tuple)):
+        try:
+            return json.dumps(value, ensure_ascii=False)
+        except (TypeError, ValueError):
+            return str(value)
+    text = str(value)
+    return text if text else "--"
 
 
 # =============================================================================
@@ -1776,6 +1939,7 @@ class TabPlotManager(QWidget):
         self._data_manager = data_manager
         self._tabs: list[BaseTab] = []
         self._overview_tab: OverviewTab | None = None
+        self._diagnostics_tab: DiagnosticsTab | None = None
         self._tab_widget = QTabWidget()
 
         layout = QVBoxLayout(self)
@@ -1798,6 +1962,8 @@ class TabPlotManager(QWidget):
         ]
         for tc in tab_classes:
             t = tc(data_manager)
+            if isinstance(t, DiagnosticsTab):
+                self._diagnostics_tab = t
             self._tabs.append(t)
             self._tab_widget.addTab(t, t.tab_title())
 
@@ -1897,10 +2063,9 @@ class TabPlotManager(QWidget):
         # 同步下拉框到当前模式的实际窗口长度
         window = self._data_manager.window_seconds()
         if window is not None:
-            windows = [30, 120, 600]
-            if window in windows:
+            if window in DEFAULT_TIME_WINDOWS:
                 self._window_combo.blockSignals(True)
-                self._window_combo.setCurrentIndex(windows.index(window))
+                self._window_combo.setCurrentIndex(DEFAULT_TIME_WINDOWS.index(window))
                 self._window_combo.blockSignals(False)
 
         self._reset_views_for_mode()
@@ -1927,8 +2092,7 @@ class TabPlotManager(QWidget):
         参数：
           index: 下拉框选中索引（0=30s, 1=2min, 2=10min）。
         """
-        windows = [30, 120, 600]
-        window = windows[index]
+        window = DEFAULT_TIME_WINDOWS[index]
         self._data_manager.set_window_seconds(window)
 
         mode = self._data_manager.display_mode
@@ -1975,9 +2139,10 @@ class TabPlotManager(QWidget):
         """
         self._data_manager.clear()
         for tab in self._tabs:
-            if hasattr(tab, '_plot_group') and tab._plot_group:
-                tab._plot_group.clear()
-                tab._plot_group.clear_time_markers()
+            pg = tab.plot_group
+            if pg is not None:
+                pg.clear()
+                pg.clear_time_markers()
             tab.refresh()
         self._reset_views_for_mode()
         self._update_time_markers()
@@ -1994,6 +2159,10 @@ class TabPlotManager(QWidget):
     def set_esp_status_text(self, text: str) -> None:
         if self._overview_tab:
             self._overview_tab.set_esp_status_text(text)
+
+    def set_esp_status_message(self, message: FlexibleMessage) -> None:
+        if self._diagnostics_tab:
+            self._diagnostics_tab.set_esp_status_message(message)
 
     def update_all(self) -> None:
         """统一刷新入口（由 DataManager.data_received 信号驱动）。
@@ -2042,7 +2211,7 @@ class TabPlotManager(QWidget):
         x_min = float(state["x_min"])
         x_max = float(state["x_max"])
         for tab in self._tabs:
-            pg = getattr(tab, '_plot_group', None)
+            pg = tab.plot_group
             if pg is not None:
                 pg.reset_views(x_min=x_min, x_max=x_max)
 
@@ -2056,7 +2225,7 @@ class TabPlotManager(QWidget):
         x_min = now - window
         x_max = now
         for tab in self._tabs:
-            pg = getattr(tab, '_plot_group', None)
+            pg = tab.plot_group
             if pg is not None and pg.first_plot is not None:
                 pg.first_plot.setXRange(x_min, x_max, padding=0.0)
 
@@ -2082,7 +2251,7 @@ class TabPlotManager(QWidget):
         now = datetime.now().timestamp()
 
         for tab in self._tabs:
-            pg = getattr(tab, '_plot_group', None)
+            pg = tab.plot_group
             if pg is None:
                 continue
 
@@ -2152,6 +2321,7 @@ class TabPlotManager(QWidget):
 # =============================================================================
 
 __all__ = [
+    "DEFAULT_TIME_WINDOWS",
     "TabPlotManager",
     "PlotGroup",
     "OverviewTab",

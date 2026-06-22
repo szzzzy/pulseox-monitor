@@ -68,7 +68,8 @@ from .usb_handler import USBHandler, DEFAULT_BAUDRATE
 UPSTREAM_TOPIC = "pulseox/data"      # 上行：ESP32 发布测量数据
 STATUS_TOPIC = "pulseox/status"      # ESP32 状态主题（retained）
 DOWNSTREAM_TOPIC = "pulseox/cmd"     # 下行：GUI 发送控制命令
-DEFAULT_MQTT_BROKER_URI = os.environ.get("MQTT_BROKER_URI", "172.20.10.4")
+DEFAULT_MQTT_BROKER_URI = os.environ.get("MQTT_BROKER_URI", "mqtt://172.20.10.4")
+DEFAULT_MQTT_KEEPALIVE_SECONDS = 30
 ESP_STATUS_TIMEOUT_SECONDS = 8
 
 # ---- 本地 mosquitto Broker 路径 ----
@@ -79,6 +80,11 @@ DEFAULT_MOSQUITTO_CONF = r"D:\MOSQUITTO\my_mosquitto.conf"
 TRANSPORT_MQTT = "MQTT"
 TRANSPORT_USB = "USB"
 TRANSPORT_MODES = [TRANSPORT_MQTT, TRANSPORT_USB]
+
+
+def build_settime_command(now: datetime) -> str:
+    """构造当前 STM32 协议识别的 RTC 对时命令。"""
+    return f"SETTIME {now:%Y-%m-%d} {now:%H:%M:%S}"
 
 
 class MainWindow(QMainWindow):
@@ -686,8 +692,8 @@ class MainWindow(QMainWindow):
         # 自动启动本地 Broker
         if self.auto_start_broker_checkbox.isChecked() and is_local_broker_host(host):
             ready = self.broker_manager.ensure_broker_running(
-                executable_hint=r"D:\MOSQUITTO\mosquitto.exe",
-                config_hint=r"D:\MOSQUITTO\my_mosquitto.conf",
+                executable_hint=DEFAULT_MOSQUITTO_EXE,
+                config_hint=DEFAULT_MOSQUITTO_CONF,
                 host=host,
                 port=port,
             )
@@ -706,6 +712,7 @@ class MainWindow(QMainWindow):
             username=self.username_input.text().strip(),
             password=self.password_input.text(),
             client_id=f"pulseox-monitor-{uuid4().hex[:8]}",
+            keepalive=DEFAULT_MQTT_KEEPALIVE_SECONDS,
         )
 
     def _disconnect_mqtt(self) -> None:
@@ -776,7 +783,7 @@ class MainWindow(QMainWindow):
 
         try:
             port_infos = USBHandler.available_ports()
-        except Exception as exc:
+        except (OSError, ImportError) as exc:
             self.com_port_combo.clear()
             self.com_port_combo.addItem(self._NO_PORT_PLACEHOLDER)
             self.com_port_combo.setToolTip(f"COM 口枚举异常: {exc}")
@@ -852,7 +859,7 @@ class MainWindow(QMainWindow):
         """
         now = datetime.now()
         # 构造 SETTIME 命令（STM32 当前协议格式）
-        command_text = f"SETTIME {now:%Y-%m-%d} {now:%H:%M:%S}"
+        command_text = build_settime_command(now)
 
         # 根据当前 transport 选择发送路径
         if self._active_transport == TRANSPORT_MQTT:
@@ -891,8 +898,8 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(self, "参数错误", str(exc))
             return
         started = self.broker_manager.ensure_broker_running(
-            executable_hint=r"D:\MOSQUITTO\mosquitto.exe",
-            config_hint=r"D:\MOSQUITTO\my_mosquitto.conf",
+            executable_hint=DEFAULT_MOSQUITTO_EXE,
+            config_hint=DEFAULT_MOSQUITTO_CONF,
             host=host,
             port=port,
         )
@@ -1016,6 +1023,7 @@ class MainWindow(QMainWindow):
         self._esp_protocol_error_count = message.esp_protocol_error_count
         self._last_esp_status_at = datetime.now()
         self._esp_status_timed_out = False
+        self.tab_manager.set_esp_status_message(message)
         self._refresh_esp_status_labels()
         online_text, _ = self._online_text(self._effective_esp_online())
         channel_text = self._channel_display_text(self._esp_transport_active)

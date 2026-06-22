@@ -20,10 +20,11 @@ from .models import FlexibleMessage, MessageValidationError
 # =============================================================================
 # STM32F407 USART2 CSV 列映射表
 #
-# 当前 STM32 固件通过 USART2 输出 102 列 CSV 数据，格式为：
-#   M,<col1>,<col2>,...,<col101>\\r\\n
+# 当前 STM32 固件通过 USART2 输出 110 列 CSV 数据，格式为：
+#   M,<col1>,<col2>,...,<col109>\\r\\n
 #
 # 列 0 固定为帧类型标识符 "M"（measurement）。
+# 0-101 列保持旧顺序不变，新增 102-109 为 ECG 质量字段。
 # 本映射表将 CSV 列索引映射为 JSON 字段名，
 # 仅映射 PC 上位机需要显示和使用的列，
 # OLED only / internal 字段不在此表中。
@@ -33,68 +34,161 @@ CSV_COLUMN_MAP: dict[int, str] = {
     # ---- 帧类型 ----
     0: "frame_type",
 
-    # ---- 核心生命体征：BPM / SpO2 / RR / IBI（列 8-15） ----
-    8: "bpm",
-    9: "bpm_valid",
-    10: "spo2",
-    11: "spo2_valid",
-    12: "rr",
-    13: "rr_valid",
-    14: "ibi",
-    15: "ibi_valid",
+    # ---- RTC / 日期时间（列 1-3） ----
+    1: "rtc_valid",
+    2: "date",
+    3: "time",
+
+    # ---- PPG 原始信号（列 4-7） ----
+    4: "red",
+    5: "ir",
+    6: "baseline_ir",
+    7: "finger",
+
+    # ---- 核心生命体征：valid/value 成对，valid 在前（列 8-15） ----
+    8: "bpm_valid",
+    9: "bpm",
+    10: "spo2_valid",
+    11: "spo2",
+    12: "rr_valid",
+    13: "rr",
+    14: "ibi_valid",
+    15: "ibi",
 
     # ---- HRV 时域指标（列 16-19） ----
-    16: "mean_ibi",
-    17: "sdnn",
-    18: "rmssd",
-    19: "hrv_valid",
+    16: "hrv_valid",
+    17: "mean_ibi",
+    18: "sdnn",
+    19: "rmssd",
+
+    # ---- 运动检测（列 20-21） ----
+    20: "motion_artifact",
+    21: "motion_score",
+
+    # ---- HRV Poincaré / 心律（列 22-25） ----
+    22: "sd1",
+    23: "sd2",
+    24: "sd1_sd2_x100",
+    25: "rhythm_irregular",
 
     # ---- HRV 频域指标（列 26-29） ----
-    26: "lf_power_x100",
-    27: "hf_power_x100",
-    28: "lf_hf_x100",
-    29: "hrv_freq_valid",
+    26: "hrv_freq_valid",
+    27: "lf_power_x100",
+    28: "hf_power_x100",
+    29: "lf_hf_x100",
 
     # ---- 信号质量 / 灌注指数 / 平衡状态（列 30-38） ----
-    30: "signal_quality",       # 信号质量评分 0-100
-    31: "signal_ir_pi_x1000",   # IR 灌注指数 ×1000
-    32: "signal_red_pi_x1000",  # Red 灌注指数 ×1000
-    33: "signal_ir_ac_rms",     # IR 交流分量 RMS
-    34: "signal_red_ac_rms",    # Red 交流分量 RMS
-    35: "spo2_ratio_x1000",     # SpO2 R 比值 ×1000
-    36: "spo2_ratio_valid",     # R 比值有效标志
-    37: "spo2_balance_status",  # 平衡状态码
-    38: "motion_score",         # 运动评分
+    30: "signal_quality",
+    31: "raw_signal_present",
+    32: "signal_ir_pi_x1000",
+    33: "signal_red_pi_x1000",
+    34: "signal_ir_ac_rms",
+    35: "signal_red_ac_rms",
+    36: "spo2_ratio_valid",
+    37: "spo2_ratio_x1000",
+    38: "spo2_balance_status",
 
-    # ---- ECG / PTT 相关（列 72-79） ----
-    72: "ecg_valid",            # ECG 数据有效标志
-    73: "ecg_hr",               # ECG 心率 (bpm)
-    74: "ecg_rr_ms",            # ECG RR 间期 (ms)
-    75: "ecg_lead_off",         # 导联脱落位掩码
-    76: "ecg_r_peak_ms",        # R 波峰值时间 (ms)
-    77: "ecg_filtered",         # ECG 滤波后 ADC 值
-    78: "ptt_valid",            # PTT 有效标志
-    79: "ptt_ms",               # 脉搏传导时间 (ms)
+    # ---- PPG 信号诊断 / 手指检测统计（列 39-46） ----
+    39: "baseline_range_ir",
+    40: "adaptive_finger_on_delta",
+    41: "adaptive_finger_off_delta",
+    42: "ir_signal_delta",
+    43: "ir_signal_span",
+    44: "red_signal_span",
+    45: "finger_on_confirm_count",
+    46: "finger_off_confirm_count",
 
-    # ---- 系统诊断字段（列 80-90） ----
-    80: "sd_log_active",             # SD 卡日志活跃标志
-    81: "sd_state",                  # SD 卡状态码
-    82: "sd_error",                  # SD 卡错误码
-    83: "sd_total_written",          # SD 卡累计写入字节
-    84: "display_refresh_count",     # 显示屏刷新计数
-    85: "display_last_refresh_tick", # 显示屏上次刷新 tick
-    86: "debug_mode",                # 调试模式标志
-    87: "current_page",              # 当前显示页面编号
-    88: "crash_flag",                # 崩溃标志
-    89: "crash_source",              # 崩溃来源码
-    90: "reboot_count",              # 重启计数
+    # ---- 传感器诊断（列 47-60） ----
+    47: "sensor_last_read_status",
+    48: "sensor_error_streak",
+    49: "sensor_fifo_write_ptr",
+    50: "sensor_fifo_read_ptr",
+    51: "sensor_fifo_overflow_count",
+    52: "sensor_fifo_available_samples",
+    53: "sensor_read_ok_count",
+    54: "sensor_read_busy_count",
+    55: "sensor_read_error_count",
+    56: "sensor_recover_count",
+    57: "sensor_last_sample_tick",
+    58: "sensor_sample_change_count",
+    59: "sensor_sample_same_count",
+    60: "sensor_last_i2c_error",
+
+    # ---- RTC / UART（列 61-63） ----
+    61: "rtc_read_ok",
+    62: "uart_rx_message_valid",
+    63: "uart_tx_message_valid",
+
+    # ---- SD / Display / Debug（列 64-71） ----
+    64: "sd_log_active",
+    65: "sd_state",
+    66: "sd_error",
+    67: "sd_total_written",
+    68: "display_refresh_count",
+    69: "display_last_refresh_tick",
+    70: "debug_mode",
+    71: "current_page",
+
+    # ---- ECG（列 72-77） ----
+    72: "ecg_valid",
+    73: "ecg_hr",
+    74: "ecg_rr_ms",
+    75: "ecg_lead_off",
+    76: "ecg_r_peak_ms",
+    77: "ecg_filtered",
+
+    # ---- PTT（列 78-79） ----
+    78: "ptt_valid",
+    79: "ptt_ms",
+
+    # ---- ECG 计数器（列 80-84） ----
+    80: "ecg_sample_count",
+    81: "ecg_adc_sat_count",
+    82: "ecg_dma_overflow_count",
+    83: "ecg_lead_off_count",
+    84: "ecg_no_r_peak_timeout_count",
+
+    # ---- 崩溃（列 85-91） ----
+    85: "crash_flag",
+    86: "crash_source",
+    87: "crash_task",
+    88: "crash_phase",
+    89: "crash_tick",
+    90: "reboot_count",
+    91: "reset_flags",
+
+    # ---- 任务阶段（列 92-95） ----
+    92: "max_task_phase",
+    93: "ui_task_phase",
+    94: "sd_task_phase",
+    95: "wdt_task_phase",
+
+    # ---- 任务栈高水位（列 96-99） ----
+    96: "max_task_stack_hwm",
+    97: "ui_task_stack_hwm",
+    98: "sd_task_stack_hwm",
+    99: "wdt_task_stack_hwm",
+
+    # ---- 任务心跳（列 100-101） ----
+    100: "max_task_heartbeat",
+    101: "ui_task_heartbeat",
+
+    # ---- ECG 质量字段（列 102-109，v3 新增） ----
+    102: "ecg_signal_quality",
+    103: "ecg_invalid_reason",
+    104: "ecg_raw_span",
+    105: "ecg_filtered_span",
+    106: "ecg_noise_level",
+    107: "ecg_qrs_threshold",
+    108: "ecg_peak_snr_x100",
+    109: "ecg_dma_available_high_watermark",
 }
 
 # STM32 CSV 帧的前缀标识 —— 所有原始 CSV 帧必须以 "M," 开头
 _STM32_CSV_PREFIX = "M,"
 
-# 当前 STM32 固件预期的 CSV 列数（102 列）
-_EXPECTED_CSV_COLUMNS = 102
+# 当前 STM32 固件预期的 CSV 列数（110 列）
+_EXPECTED_CSV_COLUMNS = 110
 
 
 # =============================================================================
@@ -108,7 +202,7 @@ def _parse_stm32_csv_line(line: str) -> dict[str, Any] | None:
       1. 去除首尾空白和 \\r\\n 换行符。
       2. 按逗号拆分为字段列表。
       3. 校验第一列是否为 "M"（帧类型标识）。
-      4. 若列数不等于 102，记录到 parse_warnings，但不丢弃数据。
+      4. 若列数不等于 110，记录到 parse_warnings，但不丢弃数据。
       5. 按 CSV_COLUMN_MAP 将已知列映射为 JSON 字段，
          自动推断 int/float 类型。
       6. 空字符串和 "--" 视为缺失值，跳过不写入。
@@ -174,8 +268,8 @@ def _parse_stm32_csv_line(line: str) -> dict[str, Any] | None:
         if idx not in CSV_COLUMN_MAP and val.strip() not in ("", "--"):
             payload["extra_fields"].append(f"col{idx}={val}")
 
-    # ---- 步骤 7: 判定解析是否完全成功 ----
-    # 列数正确且无警告时 parse_ok=True
+    # ---- 步骤 7: PC 侧判定 —— 列数匹配且无警告时视为解析成功 ----
+    # parse_ok / rx_ms 不是 STM32 CSV 列，仅由 PC 侧解析器生成。
     payload["parse_ok"] = (
         len(parts) == _EXPECTED_CSV_COLUMNS and len(payload["parse_warnings"]) == 0
     )
@@ -258,6 +352,14 @@ _FIELD_ALIASES: dict[str, tuple[str, ...]] = {
     "ecg_rr_ms": ("ecg_rr", "ecgRr", "ecgRrMs"),
     "ptt_ms": ("ptt", "pttMs"),
     "ptt_valid": ("pttValid",),
+    "ecg_signal_quality": ("ecgSignalQuality", "ecg_sq", "ecgSq"),
+    "ecg_invalid_reason": ("ecgInvalidReason",),
+    "ecg_raw_span": ("ecgRawSpan",),
+    "ecg_filtered_span": ("ecgFilteredSpan", "ecgFiltSpan"),
+    "ecg_noise_level": ("ecgNoiseLevel",),
+    "ecg_qrs_threshold": ("ecgQrsThreshold",),
+    "ecg_peak_snr_x100": ("ecgPeakSnrX100", "ecgPeakSNRx100"),
+    "ecg_dma_available_high_watermark": ("ecgDmaAvailHwm", "ecg_dma_avail_hwm"),
 }
 
 
@@ -346,6 +448,13 @@ def _normalize_payload(payload: dict) -> dict:
 
     # 步骤 2b: 常见别名字段补齐为标准字段
     _normalize_field_aliases(result)
+
+    # ESP32 parse_error 早期固件有时把原始 STM32 行放在 raw。
+    # GUI 诊断页统一读 raw_line，保留 raw 本身不删除。
+    if result.get("message") == "parse_error" and result.get("raw_line") is None:
+        raw_value = result.get("raw")
+        if isinstance(raw_value, str):
+            result["raw_line"] = raw_value
 
     # 步骤 3: 推断缺失的 message 字段
     if not result.get("message"):

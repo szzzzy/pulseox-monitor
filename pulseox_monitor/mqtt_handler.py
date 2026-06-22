@@ -43,7 +43,7 @@ class MQTTHandler(QObject):
         username: str = "",
         password: str = "",
         client_id: str = "",
-        keepalive: int = 60,
+        keepalive: int = 30,
     ) -> None:
         # 连接到 Broker，并启动 paho 的后台网络循环。
         self.disconnect_from_broker(silent=True)
@@ -68,7 +68,7 @@ class MQTTHandler(QObject):
             self.connected_changed.emit(False)
             self._client.connect_async(host=host, port=port, keepalive=keepalive)
             self._client.loop_start()
-        except Exception as exc:  # pragma: no cover - 运行期网络异常很难稳定复现。
+        except (OSError, ValueError, RuntimeError) as exc:  # pragma: no cover - 运行期网络异常很难稳定复现。
             self._connected = False
             self.connection_state_changed.emit(f"连接失败: {exc}")
             self.connected_changed.emit(False)
@@ -88,7 +88,7 @@ class MQTTHandler(QObject):
         self._client = None
         try:
             client.disconnect()
-        except Exception as exc:  # pragma: no cover - 这里只做日志兜底。
+        except (OSError, RuntimeError) as exc:  # pragma: no cover - 这里只做日志兜底。
             self.debug_message.emit(f"[MQTT] 主动断开时出现异常: {exc}")
         finally:
             client.loop_stop()
@@ -103,7 +103,7 @@ class MQTTHandler(QObject):
             self.debug_message.emit("[MQTT] 当前未连接，命令未发送")
             return False
 
-        result = self._client.publish(self.downstream_topic, payload=command_text, qos=1)
+        result = self._client.publish(self.downstream_topic, payload=command_text, qos=0)
         if result.rc != mqtt.MQTT_ERR_SUCCESS:
             self.debug_message.emit(f"[MQTT] 发布失败，返回码: {result.rc}")
             return False
@@ -188,9 +188,9 @@ class MQTTHandler(QObject):
         self.upstream_payload_received.emit(payload_text)
 
     def _subscription_topics(self) -> list[tuple[str, int]]:
-        topics: list[tuple[str, int]] = [(self.upstream_topic, 1)]
+        topics: list[tuple[str, int]] = [(self.upstream_topic, 0)]
         if self.status_topic and self.status_topic != self.upstream_topic:
-            topics.append((self.status_topic, 1))
+            topics.append((self.status_topic, 0))
         return topics
 
     def _accepted_topics(self) -> set[str]:

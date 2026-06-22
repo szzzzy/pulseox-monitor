@@ -97,6 +97,14 @@ _FIELD_ALIASES: dict[str, tuple[str, ...]] = {
     "ecg_rr_ms": ("ecg_rr", "ecgRr", "ecgRrMs"),
     "ptt_ms": ("ptt", "pttMs"),
     "ptt_valid": ("pttValid",),
+    "ecg_signal_quality": ("ecgSignalQuality", "ecg_sq", "ecgSq"),
+    "ecg_invalid_reason": ("ecgInvalidReason",),
+    "ecg_raw_span": ("ecgRawSpan",),
+    "ecg_filtered_span": ("ecgFilteredSpan", "ecgFiltSpan"),
+    "ecg_noise_level": ("ecgNoiseLevel",),
+    "ecg_qrs_threshold": ("ecgQrsThreshold",),
+    "ecg_peak_snr_x100": ("ecgPeakSnrX100", "ecgPeakSNRx100"),
+    "ecg_dma_available_high_watermark": ("ecgDmaAvailHwm", "ecg_dma_avail_hwm"),
 }
 
 
@@ -124,7 +132,8 @@ def _to_plot_float(value: object) -> float:
                 return converted
         return math.nan
     if isinstance(value, (int, float)):
-        return float(value)
+        converted = float(value)
+        return converted if math.isfinite(converted) else math.nan
     if isinstance(value, str):
         stripped = value.strip()
         if stripped in _SENTINELS:
@@ -154,6 +163,27 @@ def _plot_bool(message: FlexibleMessage, field_path: str, default: bool = True) 
         if message.has(*candidate.split(".")):
             return message.get_bool(*candidate.split("."), default=default)
     return default
+
+
+def _schema_blocks_plotting(message: FlexibleMessage) -> bool:
+    """明确 schema 异常帧保留在历史中，但不进入曲线数值。
+
+    110 列当前协议不阻断；旧 102 列允许绘图但触发 legacy warning。
+    仅 field_count < 90 或 v1.x schema 时阻断。
+    """
+    if message.message_type != "measurement":
+        return False
+    field_count = message.field_count
+    if field_count is not None and field_count < 90:
+        return True
+    schema_version = message.schema_version
+    if schema_version:
+        normalized = schema_version.strip().lower()
+        if normalized.startswith("v"):
+            normalized = normalized[1:]
+        if normalized == "1" or normalized.startswith("1."):
+            return True
+    return False
 
 
 def _needs_received_time_fallback(x_values: list[float]) -> bool:
@@ -559,11 +589,15 @@ class DataManager(QObject):
         rx: list[float] = []
 
         for msg in messages:
-            y.append(_plot_value(msg, field_path))
+            if _schema_blocks_plotting(msg):
+                y.append(math.nan)
+                is_valid = False
+            else:
+                y.append(_plot_value(msg, field_path))
 
-            is_valid = True
-            if valid_check_path:
-                is_valid = _plot_bool(msg, valid_check_path, default=True)
+                is_valid = True
+                if valid_check_path:
+                    is_valid = _plot_bool(msg, valid_check_path, default=True)
             valid.append(is_valid)
 
             rx.append(float(msg.rx_ms or 0))
@@ -590,7 +624,10 @@ class DataManager(QObject):
         for path in field_paths:
             y: list[float] = []
             for msg in messages:
-                y.append(_plot_value(msg, path))
+                if _schema_blocks_plotting(msg):
+                    y.append(math.nan)
+                else:
+                    y.append(_plot_value(msg, path))
             result[path] = (list(x), y)
 
         return result

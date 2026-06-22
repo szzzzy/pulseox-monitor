@@ -67,7 +67,7 @@ class SerialReader(QObject):
             try:
                 # readline() 阻塞直到收到换行符或超时
                 raw = self._ser.readline()
-            except Exception as exc:
+            except (OSError, ValueError) as exc:
                 if self._running:
                     self.read_error.emit(str(exc))
                 break
@@ -78,7 +78,7 @@ class SerialReader(QObject):
 
             try:
                 line = raw.decode("utf-8", errors="replace").strip()
-            except Exception:
+            except UnicodeDecodeError:
                 continue
 
             if line:
@@ -182,7 +182,7 @@ class USBHandler(QObject):
                 })
             ports_info.sort(key=lambda p: p["device"])
             return ports_info
-        except Exception:
+        except OSError:
             return []
 
     # =========================================================================
@@ -221,7 +221,7 @@ class USBHandler(QObject):
                 baudrate=baudrate,
                 timeout=self.READ_TIMEOUT,
             )
-        except Exception as exc:
+        except (OSError, ValueError, serial.SerialException) as exc:
             self.debug_message.emit(f"[USB] 打开串口失败 {port}: {exc}")
             return
 
@@ -287,7 +287,7 @@ class USBHandler(QObject):
         if self._ser:
             try:
                 self._ser.close()
-            except Exception:
+            except OSError:
                 pass
         self._ser = None
 
@@ -323,7 +323,7 @@ class USBHandler(QObject):
             self._ser.write(raw)
             self._ser.flush()
             return True
-        except Exception as exc:
+        except (OSError, ValueError) as exc:
             self.debug_message.emit(f"[USB] 发送命令失败: {exc}")
             return False
         finally:

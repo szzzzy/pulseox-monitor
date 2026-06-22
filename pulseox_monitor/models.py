@@ -2,7 +2,7 @@
 # FlexibleMessage —— MQTT 上行消息的灵活解析模型。
 #
 # 设计目标：
-#   1. 容忍字段缺失 —— 旧 ESP32（81 字段）或新 ESP32（102 字段）JSON 都能解析。
+#   1. 容忍字段缺失 —— 旧 ESP32（81 字段）或新 ESP32（110 字段）JSON 都能解析。
 #   2. 容忍非法值 —— "--", "N/A", 空字符串等哨兵值自动转换为 None/NaN。
 #   3. 永不抛异常 —— 所有类型转换函数（_safe_*）在无法转换时返回 None 或默认值。
 #   4. Schema 感知 —— 通过 schema_version / field_count / parse_warnings 检测不兼容的旧数据。
@@ -17,6 +17,7 @@
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Any
@@ -46,7 +47,7 @@ def _clean_value(value: Any) -> Any:
     清洗规则（大小写不敏感）：
       - 空字符串 ""
       - 双击 "--"           (STM32 的缺失值标记)
-      - "N/A", "n/a", "NA", "na"
+      - "N/A", "n/a", "NA", "na", "NaN", "nan"
       - "null", "NULL", "None"
 
     非字符串类型的值原样返回，不做清洗。
@@ -59,7 +60,10 @@ def _clean_value(value: Any) -> Any:
     """
     if isinstance(value, str):
         stripped = value.strip()
-        if stripped in {"", "--", "N/A", "n/a", "NA", "na", "null", "NULL", "None"}:
+        if stripped in {
+            "", "--", "N/A", "n/a", "NA", "na", "NaN", "nan",
+            "null", "NULL", "None",
+        }:
             return None
         return stripped
     return value
@@ -151,8 +155,12 @@ def _safe_int(value: Any) -> int | None:
         return int(value)
     if isinstance(value, int):
         return value
-    if isinstance(value, float) and value == int(value):
-        return int(value)
+    if isinstance(value, float):
+        if not math.isfinite(value):
+            return None
+        if value == int(value):
+            return int(value)
+        return None
     if isinstance(value, str):
         text = value.strip()
         if not text:
@@ -185,6 +193,8 @@ def _safe_float(value: Any) -> float | None:
     if value is None:
         return None
     if isinstance(value, (int, float)) and not isinstance(value, bool):
+        if isinstance(value, float) and not math.isfinite(value):
+            return None
         return float(value)
     if isinstance(value, str):
         text = value.strip()
@@ -372,9 +382,11 @@ class FlexibleMessage:
           default: 路径不存在或无法转换时的默认值。
 
         返回：
-          转换后的 int 值，或 None。
+          转换后的 int 值，或 default。
         """
-        return _safe_int(self.get(*path))
+        value = self.get(*path)
+        result = _safe_int(value)
+        return result if result is not None else default
 
     def get_float(self, *path: str, default: float | None = None) -> float | None:
         """按嵌套路径获取值并安全转换为 float。
@@ -384,9 +396,11 @@ class FlexibleMessage:
           default: 路径不存在或无法转换时的默认值。
 
         返回：
-          转换后的 float 值，或 None。
+          转换后的 float 值，或 default。
         """
-        return _safe_float(self.get(*path))
+        value = self.get(*path)
+        result = _safe_float(value)
+        return result if result is not None else default
 
     def get_str(self, *path: str, default: str | None = None) -> str | None:
         """按嵌套路径获取值并安全转换为 str。
@@ -396,9 +410,11 @@ class FlexibleMessage:
           default: 路径不存在或无法转换时的默认值。
 
         返回：
-          转换后的 str 值，或 None。
+          转换后的 str 值，或 default。
         """
-        return _safe_str(self.get(*path))
+        value = self.get(*path)
+        result = _safe_str(value)
+        return result if result is not None else default
 
     def has(self, *path: str) -> bool:
         """检查嵌套路径是否存在于 raw 字典中。
@@ -434,6 +450,16 @@ class FlexibleMessage:
                 continue
             value = self.get_str(*path)
             if value:
+                return value
+        return None
+
+    def _first_int(self, paths: tuple[tuple[str, ...], ...]) -> int | None:
+        """Return the first integer found across candidate raw-field paths."""
+        for path in paths:
+            if not self.has(*path):
+                continue
+            value = self.get_int(*path)
+            if value is not None:
                 return value
         return None
 
@@ -616,7 +642,7 @@ class FlexibleMessage:
         """信号质量评分（0-100）。
 
         0 = 极差/无信号，100 = 极佳。
-        当前 102 列 schema 中位于列 30。
+        当前 110 列 schema 中位于列 30。
         """
         return self.get_int("signal_quality")
 
@@ -640,7 +666,7 @@ class FlexibleMessage:
 
         None = 字段缺失（旧固件），True = 有信号，False = 无信号。
         """
-        return self.get("raw_signal_present")
+        return self.get_optional_bool("raw_signal_present")
 
     # =========================================================================
     # 顶层属性 —— ESP32 状态上报（esp-status-v1）
@@ -652,7 +678,7 @@ class FlexibleMessage:
 
         None 表示尚未上报或无法判断。GUI 还会结合 lastEspStatusAt 做超时判定。
         """
-        return self._first_optional_bool((("online",), ("esp", "online")))
+        return self._first_optional_bool((("online",), ("esp", "online"), ("esp_status", "online")))
 
     @property
     def esp_usb_active(self) -> bool | None:
@@ -736,6 +762,8 @@ class FlexibleMessage:
             ("transport", "mqtt_subscribed"),
             ("esp_mqtt_subscribed",),
             ("mqtt_subscribed",),
+            ("esp_status", "mqtt", "subscribed"),
+            ("esp_status", "mqtt_subscribed"),
         ))
 
     @property
@@ -745,6 +773,8 @@ class FlexibleMessage:
             ("wifi", "connected"),
             ("esp_wifi_connected",),
             ("wifi_connected",),
+            ("esp_status", "wifi", "connected"),
+            ("esp_status", "wifi_connected"),
         ))
 
     @property
@@ -784,30 +814,70 @@ class FlexibleMessage:
     @property
     def esp_stm32_protocol_state(self) -> str | None:
         """STM32/协议状态，例如 ok/error。"""
-        return self.get_str("stm32", "protocol_state")
+        return self._first_str((
+            ("stm32", "protocol_state"),
+            ("esp_stm32_protocol_state",),
+            ("stm32_protocol_state",),
+            ("protocol_state",),
+            ("esp_status", "stm32", "protocol_state"),
+            ("esp_status", "esp_stm32_protocol_state"),
+            ("esp_status", "protocol_state"),
+        ))
 
     @property
     def esp_stm32_last_frame(self) -> str | None:
         """STM32 最近帧类型。"""
-        return self.get_str("stm32", "last_frame")
+        return self._first_str((
+            ("stm32", "last_frame"),
+            ("esp_stm32_last_frame",),
+            ("stm32_last_frame",),
+            ("last_frame",),
+            ("esp_status", "stm32", "last_frame"),
+            ("esp_status", "esp_stm32_last_frame"),
+            ("esp_status", "last_frame"),
+        ))
 
     @property
     def esp_stm32_last_frame_ms(self) -> int | None:
         """STM32 最近帧时间戳（ESP uptime ms）。"""
-        return self.get_int("stm32", "last_frame_ms")
+        return self._first_int((
+            ("stm32", "last_frame_ms"),
+            ("esp_stm32_last_frame_ms",),
+            ("stm32_last_frame_ms",),
+            ("last_frame_ms",),
+            ("esp_status", "stm32", "last_frame_ms"),
+            ("esp_status", "esp_stm32_last_frame_ms"),
+            ("esp_status", "last_frame_ms"),
+        ))
 
     @property
     def esp_protocol_ok_count(self) -> int | None:
         """ESP32 协议解析成功计数。"""
-        return self.get_int("counters", "protocol_ok")
+        return self._first_int((
+            ("counters", "protocol_ok"),
+            ("protocol_ok",),
+            ("esp_protocol_ok_count",),
+            ("protocol_ok_count",),
+            ("esp_status", "counters", "protocol_ok"),
+            ("esp_status", "protocol_ok"),
+            ("esp_status", "esp_protocol_ok_count"),
+        ))
 
     @property
     def esp_protocol_error_count(self) -> int | None:
         """ESP32 协议解析错误计数。"""
-        return self.get_int("counters", "protocol_error")
+        return self._first_int((
+            ("counters", "protocol_error"),
+            ("protocol_error",),
+            ("esp_protocol_error_count",),
+            ("protocol_error_count",),
+            ("esp_status", "counters", "protocol_error"),
+            ("esp_status", "protocol_error"),
+            ("esp_status", "esp_protocol_error_count"),
+        ))
 
     # =========================================================================
-    # 顶层属性 —— ECG 相关（当前 102 列 schema，列 72-77）
+    # 顶层属性 —— ECG 相关（当前 110 列 schema，列 72-77）
     # =========================================================================
 
     @property
@@ -846,7 +916,11 @@ class FlexibleMessage:
 
     @property
     def ecg_raw(self) -> int | None:
-        """ECG 原始 ADC 值（低频趋势）。"""
+        """ECG 原始 ADC 值（低频趋势）。
+
+        STM32 UART M 帧不含此字段；仅 ESP32 JSON 可能提供。
+        缺失时返回 None。
+        """
         return self.get_int("ecg_raw")
 
     @property
@@ -858,7 +932,67 @@ class FlexibleMessage:
         return self.get_int("ecg_filtered")
 
     # =========================================================================
-    # 顶层属性 —— PTT 相关（当前 102 列 schema，列 78-79）
+    # 顶层属性 —— ECG 质量字段（v3 新增，列 102-109）
+    # =========================================================================
+
+    @property
+    def ecg_signal_quality(self) -> int | None:
+        """ECG 信号质量评分（0-100）。
+        v3 schema 中位于列 102。
+        """
+        return self.get_int("ecg_signal_quality")
+
+    @property
+    def ecg_invalid_reason(self) -> int | None:
+        """ECG 无效原因码（0=OK）。
+        v3 schema 中位于列 103。
+        """
+        return self.get_int("ecg_invalid_reason")
+
+    @property
+    def ecg_raw_span(self) -> int | None:
+        """ECG 原始信号跨度。
+        v3 schema 中位于列 104。
+        """
+        return self.get_int("ecg_raw_span")
+
+    @property
+    def ecg_filtered_span(self) -> int | None:
+        """ECG 滤波后信号跨度。
+        v3 schema 中位于列 105。
+        """
+        return self.get_int("ecg_filtered_span")
+
+    @property
+    def ecg_noise_level(self) -> int | None:
+        """ECG 噪声水平。
+        v3 schema 中位于列 106。
+        """
+        return self.get_int("ecg_noise_level")
+
+    @property
+    def ecg_qrs_threshold(self) -> int | None:
+        """ECG QRS 检测阈值。
+        v3 schema 中位于列 107。
+        """
+        return self.get_int("ecg_qrs_threshold")
+
+    @property
+    def ecg_peak_snr_x100(self) -> int | None:
+        """ECG 峰值信噪比 ×100。
+        v3 schema 中位于列 108。
+        """
+        return self.get_int("ecg_peak_snr_x100")
+
+    @property
+    def ecg_dma_available_high_watermark(self) -> int | None:
+        """ECG DMA 可用高水位标记。
+        v3 schema 中位于列 109。
+        """
+        return self.get_int("ecg_dma_available_high_watermark")
+
+    # =========================================================================
+    # 顶层属性 —— PTT 相关（当前 110 列 schema，列 78-79）
     # =========================================================================
 
     @property
@@ -1030,10 +1164,10 @@ class FlexibleMessage:
 
     @property
     def field_count(self) -> int | None:
-        """STM32 USART CSV 的列数（当前固件应为 102）。
+        """STM32 USART CSV 的列数（当前固件应为 110）。
 
-        用于检测旧固件（81 列）还是新固件（102 列）。
-        <90 的 field_count 触发 schema 警告。
+        用于检测旧固件（81/102 列）还是新固件（110 列）。
+        <90 的 field_count 触发 schema 警告；90-109 视为旧 102 列 schema。
         """
         return self.get_int("field_count")
 
@@ -1041,8 +1175,9 @@ class FlexibleMessage:
     def schema_version(self) -> str | None:
         """ESP32 JSON 的 schema 版本号。
 
-        例如 "1.0"（旧 81 字段 schema）、"2.0"（新 102 字段 schema）。
-        v1.x 版本触发 schema 警告。
+        例如 "1.0"（旧 81 字段 schema）、"2.0"（旧 102 字段 schema）、
+        "3.0"（当前 110 字段 schema）。
+        v1.x / v2.x 版本触发 schema 警告；v3.x 为当前协议。
         """
         return self.get_str("schema_version")
 
@@ -1055,7 +1190,11 @@ class FlexibleMessage:
         不作为错误处理。
         """
         v = self.get("extra_fields", default=[])
-        return v if isinstance(v, list) else []
+        if isinstance(v, list):
+            return [str(item) for item in v if _clean_value(item) is not None]
+        if _clean_value(v) is None:
+            return []
+        return [str(v)]
 
     @property
     def parse_warnings(self) -> list[Any]:
@@ -1065,7 +1204,11 @@ class FlexibleMessage:
         用于诊断面板展示，帮助判断数据质量问题。
         """
         warnings = self.get("parse_warnings", default=[])
-        return warnings if isinstance(warnings, list) else []
+        if isinstance(warnings, list):
+            return [w for w in warnings if _clean_value(w) is not None]
+        if _clean_value(warnings) is None:
+            return []
+        return [warnings]
 
     # =========================================================================
     # Schema 兼容性检测
@@ -1076,9 +1219,16 @@ class FlexibleMessage:
 
         检测规则：
           1. field_count < 90 → 疑似旧 81 字段 schema。
-          2. parse_warnings 非空 → 设备端已报告问题。
-          3. schema_version 以 "1." 开头 → 明确的旧版本。
-          4. 缺少 ecg_valid 和 signal_quality 且无元数据 → 潜在旧 schema。
+          2. field_count 在 90-109（如 102）→ 旧 102 列 schema（legacy）。
+          3. field_count > 110 → 列数超出当前 110 列 schema。
+          4. parse_warnings 非空 → 设备端已报告问题。
+          5. schema_version v1.x / v2.x → 明确的旧版本。
+          6. protocol 为旧 schema 标识 → 旧版本。
+          7. parse_ok 为 False → 设备端或解析器判定为非完全成功。
+
+        当前协议识别的有效组合：
+          - schema_version=3 / field_count=110
+          - protocol=stm32-compact-v3 / field_count=110
 
         返回：
           若存在问题时返回人类可读的警告字符串，
@@ -1091,34 +1241,69 @@ class FlexibleMessage:
         if fc is not None and fc < 90:
             warnings.append(f"field_count={fc} (<90, 疑似旧 81 字段 schema)")
 
-        # 规则 2: 设备端已报告的解析警告
+        # 规则 2: field_count 在 90-109（如旧 102 列）→ legacy warning
+        if fc is not None and 90 <= fc < 110:
+            warnings.append(
+                f"field_count={fc} (旧 {fc} 列 schema，当前协议为 110 列)"
+            )
+
+        # 规则 2b: field_count > 110 → 超出当前 schema
+        if fc is not None and fc > 110:
+            warnings.append(
+                f"field_count={fc} (超出当前 110 列 schema)"
+            )
+
+        # 规则 3: 设备端已报告的解析警告
         if self.parse_warnings:
             warnings.append(f"parse_warnings: {self.parse_warnings}")
 
-        # 规则 3: schema_version 为 v1.x（旧版本）
+        # 规则 4: schema_version 检测
         sv = self.schema_version
-        if sv and sv.startswith("1."):
-            warnings.append(f"schema_version={sv} (v1.x 为旧版本)")
+        if sv:
+            normalized_sv = sv.strip().lower()
+            if normalized_sv.startswith("v"):
+                normalized_sv = normalized_sv[1:]
+            if normalized_sv == "1" or normalized_sv.startswith("1."):
+                warnings.append(f"schema_version={sv} (v1.x 为旧版本)")
+            elif normalized_sv == "2" or normalized_sv.startswith("2."):
+                warnings.append(
+                    f"schema_version={sv} (v2.x 为旧 102 列 schema，当前 GUI 期望 v3)"
+                )
+            elif (
+                self.message_type == "measurement"
+                and normalized_sv != "3"
+                and not normalized_sv.startswith("3.")
+            ):
+                warnings.append(f"schema_version={sv} (当前 GUI 期望 v3)")
 
-        # 规则 4: 无元数据时的启发式检测
-        if not fc and not sv and not self.parse_warnings:
-            if not self.has("ecg_valid") and not self.has("signal_quality"):
-                warnings.append("缺少 ecg_valid/signal_quality 字段 —— 可能为旧 schema")
+        # 规则 5: protocol 检测 —— stm32-compact-v3 为当前协议
+        prot = self.protocol
+        if prot and self.message_type == "measurement":
+            normalized_prot = prot.strip().lower().replace("_", "-")
+            if normalized_prot in ("stm32-compact-v1", "stm32-compact-v2"):
+                warnings.append(
+                    f"protocol={prot} (旧协议，当前 GUI 期望 stm32-compact-v3)"
+                )
+
+        # 规则 6: parse_ok 为 False
+        if not self.parse_ok:
+            warnings.append("parse_ok=False (解析非完全成功)")
 
         return "; ".join(warnings) if warnings else None
 
     # =========================================================================
-    # 顶层属性 —— 系统诊断（当前 102 字段 schema 的系统字段）
+    # 顶层属性 —— 系统诊断（当前 110 字段 schema 的系统字段）
     #
     # 替换了旧 schema 中的 sd_card_ready / sd_log_error / display_brightness_index。
-    # 当前 102 列中位于列 80-90。
+    # 当前 110 列：RTC/UART 在列 61-63，SD/Display/Debug 在列 64-71；
+    # 崩溃/任务/栈/心跳在列 85-101；ECG 质量在列 102-109。
     # =========================================================================
 
     @property
     def sd_log_active(self) -> bool:
         """SD 卡日志是否活跃（正在记录）。
 
-        当前 schema 中位于列 80。
+        当前 schema 中位于列 64。
         """
         return self.get_bool("sd_log_active")
 
@@ -1126,7 +1311,7 @@ class FlexibleMessage:
     def sd_state(self) -> int | None:
         """SD 卡状态码。
 
-        当前 schema 中位于列 81。
+        当前 schema 中位于列 65。
         0=未初始化, 1=就绪, 2=记录中, 3=错误。
         """
         return self.get_int("sd_state")
@@ -1135,7 +1320,7 @@ class FlexibleMessage:
     def sd_error(self) -> int | None:
         """SD 卡错误码。
 
-        当前 schema 中位于列 82。
+        当前 schema 中位于列 66。
         0=无错误，非 0 表示具体的错误类型。
         """
         return self.get_int("sd_error")
@@ -1144,7 +1329,7 @@ class FlexibleMessage:
     def sd_total_written(self) -> int | None:
         """SD 卡累计写入字节数。
 
-        当前 schema 中位于列 83。
+        当前 schema 中位于列 67。
         """
         return self.get_int("sd_total_written")
 
@@ -1152,7 +1337,7 @@ class FlexibleMessage:
     def display_refresh_count(self) -> int | None:
         """OLED 显示屏刷新计数。
 
-        当前 schema 中位于列 84。
+        当前 schema 中位于列 68。
         """
         return self.get_int("display_refresh_count")
 
@@ -1160,7 +1345,7 @@ class FlexibleMessage:
     def display_last_refresh_tick(self) -> int | None:
         """OLED 显示屏上次刷新时的系统 tick。
 
-        当前 schema 中位于列 85。
+        当前 schema 中位于列 69。
         """
         return self.get_int("display_last_refresh_tick")
 
@@ -1168,7 +1353,7 @@ class FlexibleMessage:
     def debug_mode(self) -> bool:
         """是否处于调试模式。
 
-        当前 schema 中位于列 86。
+        当前 schema 中位于列 70。
         """
         return self.get_bool("debug_mode")
 
@@ -1176,7 +1361,7 @@ class FlexibleMessage:
     def current_page(self) -> int | None:
         """当前 OLED 显示页面编号。
 
-        当前 schema 中位于列 87。
+        当前 schema 中位于列 71。
         """
         return self.get_int("current_page")
 
@@ -1184,7 +1369,7 @@ class FlexibleMessage:
     def crash_flag(self) -> bool:
         """是否发生过崩溃（看门狗/硬故障等）。
 
-        当前 schema 中位于列 88。
+        当前 schema 中位于列 85。
         True = 系统曾崩溃并重启。
         """
         return self.get_bool("crash_flag")
@@ -1193,7 +1378,7 @@ class FlexibleMessage:
     def crash_source(self) -> int | None:
         """崩溃来源码。
 
-        当前 schema 中位于列 89。
+        当前 schema 中位于列 86。
         编码含义见 STM32 固件的 crash_reason 枚举。
         """
         return self.get_int("crash_source")
@@ -1205,6 +1390,76 @@ class FlexibleMessage:
         当前 schema 中位于列 90。
         """
         return self.get_int("reboot_count")
+
+    @property
+    def crash_task(self) -> int | None:
+        """崩溃任务标识，当前 schema 中位于列 87。"""
+        return self.get_int("crash_task")
+
+    @property
+    def crash_phase(self) -> int | None:
+        """崩溃阶段标识，当前 schema 中位于列 88。"""
+        return self.get_int("crash_phase")
+
+    @property
+    def crash_tick(self) -> int | None:
+        """崩溃发生时的系统 tick，当前 schema 中位于列 89。"""
+        return self.get_int("crash_tick")
+
+    @property
+    def reset_flags(self) -> int | None:
+        """复位标志位，当前 schema 中位于列 91。"""
+        return self.get_int("reset_flags")
+
+    @property
+    def max_task_phase(self) -> int | None:
+        """MAX30102 任务阶段，当前 schema 中位于列 92。"""
+        return self.get_int("max_task_phase")
+
+    @property
+    def ui_task_phase(self) -> int | None:
+        """UI 任务阶段，当前 schema 中位于列 93。"""
+        return self.get_int("ui_task_phase")
+
+    @property
+    def sd_task_phase(self) -> int | None:
+        """SD 任务阶段，当前 schema 中位于列 94。"""
+        return self.get_int("sd_task_phase")
+
+    @property
+    def wdt_task_phase(self) -> int | None:
+        """看门狗任务阶段，当前 schema 中位于列 95。"""
+        return self.get_int("wdt_task_phase")
+
+    @property
+    def max_task_stack_hwm(self) -> int | None:
+        """MAX30102 任务栈高水位，当前 schema 中位于列 96。"""
+        return self.get_int("max_task_stack_hwm")
+
+    @property
+    def ui_task_stack_hwm(self) -> int | None:
+        """UI 任务栈高水位，当前 schema 中位于列 97。"""
+        return self.get_int("ui_task_stack_hwm")
+
+    @property
+    def sd_task_stack_hwm(self) -> int | None:
+        """SD 任务栈高水位，当前 schema 中位于列 98。"""
+        return self.get_int("sd_task_stack_hwm")
+
+    @property
+    def wdt_task_stack_hwm(self) -> int | None:
+        """看门狗任务栈高水位，当前 schema 中位于列 99。"""
+        return self.get_int("wdt_task_stack_hwm")
+
+    @property
+    def max_task_heartbeat(self) -> int | None:
+        """MAX30102 任务心跳，当前 schema 中位于列 100。"""
+        return self.get_int("max_task_heartbeat")
+
+    @property
+    def ui_task_heartbeat(self) -> int | None:
+        """UI 任务心跳，当前 schema 中位于列 101。"""
+        return self.get_int("ui_task_heartbeat")
 
     # =========================================================================
     # 顶层属性 —— RTC 对时确认（message_type = "rtc_set_ack"）
@@ -1350,11 +1605,21 @@ KNOWN_FIELD_PATHS: list[tuple[str, str]] = [
     ("hf_power_x100", "HF Power×100"),
     ("lf_hf_x100", "LF/HF×100"),
 
-    # ---- ECG / PTT（当前 102 字段 schema: ecg_filtered, ecg_hr, ecg_rr_ms, ptt_ms） ----
+    # ---- ECG / PTT（当前 110 字段 schema: ecg_filtered, ecg_hr, ecg_rr_ms, ptt_ms） ----
     ("ecg_filtered", "ECG Filt"),
     ("ecg_hr", "ECG HR"),
     ("ecg_rr_ms", "ECG RR"),
     ("ptt_ms", "PTT"),
+
+    # ---- ECG 质量字段（v3 新增，列 102-109） ----
+    ("ecg_signal_quality", "ECG SQ"),
+    ("ecg_invalid_reason", "ECG Invalid Reason"),
+    ("ecg_raw_span", "ECG Raw Span"),
+    ("ecg_filtered_span", "ECG Filt Span"),
+    ("ecg_noise_level", "ECG Noise Level"),
+    ("ecg_qrs_threshold", "ECG QRS Threshold"),
+    ("ecg_peak_snr_x100", "ECG Peak SNR×100"),
+    ("ecg_dma_available_high_watermark", "ECG DMA Avail HWM"),
 
     # ---- PPG 信号诊断 ----
     ("ir_signal_delta", "IR Delta"),
@@ -1366,7 +1631,11 @@ KNOWN_FIELD_PATHS: list[tuple[str, str]] = [
 
     # ---- 解析校验 ----
     ("parse_ok", "Parse OK"),
+    ("schema_version", "Schema Version"),
     ("field_count", "Field Count"),
+    ("parse_warnings", "Parse Warnings"),
+    ("extra_fields", "Extra Fields"),
+    ("raw_line", "Raw Line"),
     ("rx_ms", "RX ms"),
 
     # ---- ESP32 链路状态 ----
@@ -1385,4 +1654,29 @@ KNOWN_FIELD_PATHS: list[tuple[str, str]] = [
     ("esp_usb_connected", "ESP USB Connected"),
     ("esp_mqtt_connected", "ESP MQTT Connected"),
     ("esp_transport_mode", "ESP Transport Mode"),
+
+    # ---- 当前 110 字段系统诊断 ----
+    ("sd_log_active", "SD Log Active"),
+    ("sd_state", "SD State"),
+    ("sd_error", "SD Error"),
+    ("sd_total_written", "SD Total Written"),
+    ("debug_mode", "Debug Mode"),
+    ("current_page", "Current Page"),
+    ("crash_flag", "Crash Flag"),
+    ("crash_source", "Crash Source"),
+    ("crash_task", "Crash Task"),
+    ("crash_phase", "Crash Phase"),
+    ("crash_tick", "Crash Tick"),
+    ("reboot_count", "Reboot Count"),
+    ("reset_flags", "Reset Flags"),
+    ("max_task_phase", "MAX Task Phase"),
+    ("ui_task_phase", "UI Task Phase"),
+    ("sd_task_phase", "SD Task Phase"),
+    ("wdt_task_phase", "WDT Task Phase"),
+    ("max_task_stack_hwm", "MAX Task Stack HWM"),
+    ("ui_task_stack_hwm", "UI Task Stack HWM"),
+    ("sd_task_stack_hwm", "SD Task Stack HWM"),
+    ("wdt_task_stack_hwm", "WDT Task Stack HWM"),
+    ("max_task_heartbeat", "MAX Task Heartbeat"),
+    ("ui_task_heartbeat", "UI Task Heartbeat"),
 ]

@@ -40,7 +40,7 @@ def _make_msg(
         "spo2": spo2,
         "rx_ms": 100,
         "parse_ok": True,
-        "field_count": 12,
+        "field_count": 110,
         "parse_warnings": [],
         "extra_fields": [],
     }
@@ -90,6 +90,51 @@ class DataManagerTests(unittest.TestCase):
         self.assertFalse(valid_bpm[0])
         self.assertFalse(valid_spo2[0])
 
+    def test_schema_issue_frame_is_kept_but_not_plotted(self) -> None:
+        manager = DataManager(max_history=10)
+        msg = _make_msg(
+            received_at=datetime.now(),
+            field_count=81,
+            parse_ok=False,
+            parse_warnings=["CSV columns=81, expected=110"],
+            bpm=72,
+            signal_quality=85,
+            ecg_hr=70,
+            ecg_rr_ms=850,
+            ptt_ms=240,
+        )
+        manager.add_message(msg)
+
+        self.assertEqual(len(manager), 1)
+        self.assertEqual(manager.latest().bpm, 72)
+        self.assertIn("field_count=81", manager.latest().detect_schema_issue())
+
+        for field in ("bpm", "signal_quality", "ecg_hr", "ecg_rr_ms", "ptt_ms"):
+            _, y_vals, valid, _ = manager.series(field)
+            self.assertTrue(math.isnan(y_vals[0]))
+            self.assertFalse(valid[0])
+
+    def test_legacy_102_columns_not_blocked_for_plotting(self) -> None:
+        """Legacy 102-column data should still be plotted (not NaN)."""
+        manager = DataManager(max_history=10)
+        msg = _make_msg(
+            received_at=datetime.now(),
+            field_count=102,
+            parse_ok=False,
+            parse_warnings=["CSV columns=102, expected=110"],
+            bpm=72,
+            signal_quality=85,
+            ecg_hr=70,
+        )
+        manager.add_message(msg)
+
+        self.assertEqual(len(manager), 1)
+        self.assertEqual(manager.latest().bpm, 72)
+        # Legacy 102 should NOT be blocked from plotting
+        _, y_vals, valid, _ = manager.series("bpm")
+        self.assertEqual(y_vals[0], 72.0)
+        self.assertTrue(valid[0])
+
     def test_valid_check_path(self) -> None:
         manager = DataManager(max_history=10)
         manager.add_message(
@@ -118,7 +163,7 @@ class DataManagerTests(unittest.TestCase):
             "rtc_valid": True, "date": now.strftime("%Y%m%d"), "time": now.strftime("%H%M%S"),
             "red": 100, "ir": 200, "baseline_ir": 180, "finger": True,
             "bpm_valid": True, "bpm": 72, "spo2_valid": True, "spo2": 98,
-            "rx_ms": 100, "parse_ok": True, "field_count": 12,
+            "rx_ms": 100, "parse_ok": True, "field_count": 110,
             "parse_warnings": [], "extra_fields": [],
             "modules": {
                 "bpm": {"available": True, "valid": True, "value": 72},
@@ -137,7 +182,7 @@ class DataManagerTests(unittest.TestCase):
             "rtc_valid": True, "date": "20260409", "time": "100000",
             "red": 100, "ir": 200, "baseline_ir": 180, "finger": True,
             "bpm_valid": True, "bpm": 72, "spo2_valid": True, "spo2": 98,
-            "rx_ms": 100, "parse_ok": True, "field_count": 12,
+            "rx_ms": 100, "parse_ok": True, "field_count": 110,
             "parse_warnings": [], "extra_fields": [],
             "modules": {"bpm": {"available": True, "value": 72}},
         }
@@ -179,7 +224,7 @@ class DataManagerTests(unittest.TestCase):
             "red": "100", "ir": "200", "baseline_ir": "180", "finger": True,
             "bpm_valid": True, "bpm": "72",
             "spo2_valid": True, "spo2": "98",
-            "rx_ms": 100, "parse_ok": True, "field_count": 12,
+            "rx_ms": 100, "parse_ok": True, "field_count": 110,
             "parse_warnings": [], "extra_fields": [],
         }
         msg = FlexibleMessage.from_dict(payload)

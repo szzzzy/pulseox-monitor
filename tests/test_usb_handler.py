@@ -11,6 +11,7 @@
 
 from __future__ import annotations
 
+from datetime import datetime
 import unittest
 
 # 检测 PySide6 是否可用
@@ -83,7 +84,7 @@ class DataLineFilterTests(unittest.TestCase):
         """以 M, 开头的 STM32 raw CSV 行应被识别为数据行。"""
         self.assertData("M,72,1,98,1,16,1")
         self.assertData(
-            "M," + ",".join(["0"] * 101)
+            "M," + ",".join(["0"] * 109)
         )
 
     # ── ESP_LOG 噪声 ──
@@ -225,13 +226,13 @@ class USBLineToDispatcherIntegrationTests(unittest.TestCase):
         from pulseox_monitor.dispatcher import MessageDispatcher
 
         dispatcher = MessageDispatcher()
-        # 构造一个简单的 CSV 帧（102 列）
-        cols = ["0"] * 102
+        # 构造一个简单的 CSV 帧（110 列）
+        cols = ["0"] * 110
         cols[0] = "M"
-        cols[8] = "75"
-        cols[9] = "1"
-        cols[10] = "99"
-        cols[11] = "1"
+        cols[8] = "1"     # bpm_valid
+        cols[9] = "75"    # bpm
+        cols[10] = "1"    # spo2_valid
+        cols[11] = "99"   # spo2
         line = ",".join(cols)
 
         # 1. 过滤通过
@@ -253,6 +254,167 @@ class USBLineToDispatcherIntegrationTests(unittest.TestCase):
         self.assertFalse(_is_data_line("I (12345) wifi: connected"))
         self.assertFalse(_is_data_line("W (12346) main: heap min free: 123456"))
         self.assertFalse(_is_data_line("E (12347) sensor: read failed"))
+
+    def test_usb_path_dispatches_all_supported_message_types(self) -> None:
+        """USB 数据路径应能接收 measurement/status/ack/parse_error。"""
+        from pulseox_monitor.usb_protocol import is_data_line as _is_data_line
+        from pulseox_monitor.dispatcher import MessageDispatcher
+
+        dispatcher = MessageDispatcher()
+        lines = [
+            '{"message":"measurement","schema_version":3,"field_count":110,"parse_ok":true,"parse_warnings":[],"bpm":72}',
+            '{"message":"esp_status","online":true,"usb":{"active":true},"mqtt":{"connected":true}}',
+            '{"message":"rtc_set_ack","set_ok":true,"rtc_valid":true,"date":"20260409","time":"120001"}',
+            '{"message":"parse_error","error":"bad columns","raw_line":"M,old"}',
+        ]
+
+        messages = []
+        for line in lines:
+            self.assertTrue(_is_data_line(line))
+            messages.append(dispatcher.dispatch(line))
+
+        self.assertEqual(
+            [msg.message_type for msg in messages],
+            ["measurement", "esp_status", "rtc_set_ack", "parse_error"],
+        )
+
+
+@unittest.skipUnless(_HAS_PYSIDE6, "需要 PySide6 环境")
+class MQTTReceivePathTests(unittest.TestCase):
+    """验证 MQTT 数据主题和状态主题都会上抛给统一 dispatcher 入口。"""
+
+    def test_mqtt_topics_emit_supported_message_types(self) -> None:
+        from pulseox_monitor.mqtt_handler import MQTTHandler
+
+        handler = MQTTHandler(
+            upstream_topic="pulseox/data",
+            status_topic="pulseox/status",
+            downstream_topic="pulseox/cmd",
+        )
+        received: list[str] = []
+        handler.upstream_payload_received.connect(received.append)
+
+        class Msg:
+            def __init__(self, topic: str, payload: str) -> None:
+                self.topic = topic
+                self.payload = payload.encode("utf-8")
+
+        payloads = [
+            ("pulseox/data", '{"message":"measurement","schema_version":3,"field_count":110}'),
+            ("pulseox/status", '{"message":"esp_status","online":true}'),
+            ("pulseox/data", '{"message":"rtc_set_ack","set_ok":true}'),
+            ("pulseox/data", '{"message":"parse_error","error":"bad columns"}'),
+        ]
+        for topic, payload in payloads:
+            handler._on_message(None, None, Msg(topic, payload))
+
+        handler._on_message(None, None, Msg("pulseox/ignored", '{"message":"ignored"}'))
+
+        self.assertEqual([payload for _topic, payload in payloads], received)
+
+
+@unittest.skipUnless(_HAS_PYSIDE6, "需要 PySide6 环境")
+class CommandSendPathTests(unittest.TestCase):
+    """验证 SETTIME 格式和 MQTT/USB 命令发送路径。"""
+
+    def test_build_settime_command_uses_current_protocol_format(self) -> None:
+        from pulseox_monitor.main_window import build_settime_command
+
+        command = build_settime_command(datetime(2026, 4, 14, 12, 34, 56))
+        self.assertEqual(command, "SETTIME 2026-04-14 12:34:56")
+
+    def test_mqtt_publish_command_sends_plain_settime(self) -> None:
+        import paho.mqtt.client as mqtt
+        from pulseox_monitor.mqtt_handler import MQTTHandler
+
+        class Result:
+            rc = mqtt.MQTT_ERR_SUCCESS
+
+        class FakeClient:
+            def __init__(self) -> None:
+                self.calls = []
+
+            def publish(self, topic, payload, qos):
+                self.calls.append((topic, payload, qos))
+                return Result()
+
+        handler = MQTTHandler("pulseox/data", "pulseox/cmd")
+        fake = FakeClient()
+        handler._client = fake
+        handler._connected = True
+
+        sent = handler.publish_command("SETTIME 2026-04-14 12:34:56")
+
+        self.assertTrue(sent)
+        self.assertEqual(
+            fake.calls,
+            [("pulseox/cmd", "SETTIME 2026-04-14 12:34:56", 0)],
+        )
+
+    def test_mqtt_subscriptions_use_qos0(self) -> None:
+        from pulseox_monitor.mqtt_handler import MQTTHandler
+
+        handler = MQTTHandler(
+            upstream_topic="pulseox/data",
+            status_topic="pulseox/status",
+            downstream_topic="pulseox/cmd",
+        )
+
+        self.assertEqual(
+            handler._subscription_topics(),
+            [("pulseox/data", 0), ("pulseox/status", 0)],
+        )
+
+    def test_mqtt_connect_default_keepalive_is_30(self) -> None:
+        from pulseox_monitor.mqtt_handler import MQTTHandler
+
+        class FakeClient:
+            def __init__(self) -> None:
+                self.connect_calls = []
+                self.loop_started = False
+
+            def reconnect_delay_set(self, min_delay, max_delay) -> None:
+                pass
+
+            def connect_async(self, host, port, keepalive) -> None:
+                self.connect_calls.append((host, port, keepalive))
+
+            def loop_start(self) -> None:
+                self.loop_started = True
+
+        handler = MQTTHandler("pulseox/data", "pulseox/cmd")
+        fake = FakeClient()
+        handler._build_client = lambda client_id: fake  # type: ignore[method-assign]
+
+        handler.connect_to_broker("172.20.10.4", 1883)
+
+        self.assertEqual(fake.connect_calls, [("172.20.10.4", 1883, 30)])
+        self.assertTrue(fake.loop_started)
+
+    def test_usb_send_command_appends_newline(self) -> None:
+        from pulseox_monitor.usb_handler import USBHandler
+
+        class FakeSerial:
+            def __init__(self) -> None:
+                self.writes = []
+                self.flushed = False
+
+            def write(self, raw: bytes) -> None:
+                self.writes.append(raw)
+
+            def flush(self) -> None:
+                self.flushed = True
+
+        handler = USBHandler()
+        fake = FakeSerial()
+        handler._connected = True
+        handler._ser = fake
+
+        sent = handler.send_command("SETTIME 2026-04-14 12:34:56")
+
+        self.assertTrue(sent)
+        self.assertEqual(fake.writes, [b"SETTIME 2026-04-14 12:34:56\n"])
+        self.assertTrue(fake.flushed)
 
 
 # =============================================================================
@@ -426,3 +588,143 @@ class PlotGroupItemIndependenceTests(unittest.TestCase):
         self._pg.clear_time_markers()
         self.assertEqual(len(self._pg._time_markers), 0)
         self.assertEqual(len(self._pg._unfilled_regions), 0)
+
+    def test_refresh_expands_y_axis_to_visible_data(self) -> None:
+        """Fixed default ranges expand when visible data falls outside them."""
+        from pulseox_monitor.models import FlexibleMessage
+        from pulseox_monitor.plot_manager import CurveDef, PlotGroup, SubplotDef
+
+        plot_group = PlotGroup(
+            self._dm,
+            [
+                SubplotDef(
+                    title="Quality",
+                    y_label="SQ",
+                    curves=[CurveDef("signal_quality", "SQ", "#0f0")],
+                    y_range=(0, 100),
+                )
+            ],
+        )
+        self._dm.add_message(
+            FlexibleMessage.from_dict(
+                {
+                    "message": "measurement",
+                    "signal_quality": 250,
+                    "field_count": 110,
+                    "parse_ok": True,
+                    "parse_warnings": [],
+                    "extra_fields": [],
+                },
+                received_at=datetime.now(),
+            )
+        )
+
+        plot_group.refresh()
+        y_min, y_max = plot_group._plots[0].getViewBox().viewRange()[1]
+
+        self.assertLessEqual(y_min, 0.0)
+        self.assertGreaterEqual(y_max, 250.0)
+
+
+@unittest.skipUnless(_HAS_PYSIDE6, "需要 PySide6 环境")
+class DiagnosticsTabCurrentSchemaTests(unittest.TestCase):
+    """验证 Diagnostics 固定显示当前 102 字段诊断名。"""
+
+    def setUp(self) -> None:
+        from PySide6.QtWidgets import QApplication
+        import sys
+        self._app = QApplication.instance() or QApplication(sys.argv)
+
+    def test_system_table_contains_current_schema_fields_and_missing_markers(self) -> None:
+        from pulseox_monitor.data_manager import DataManager
+        from pulseox_monitor.models import FlexibleMessage
+        from pulseox_monitor.plot_manager import DiagnosticsTab
+
+        manager = DataManager(max_history=10)
+        manager.add_message(FlexibleMessage.from_dict({
+            "message": "measurement",
+            "schema_version": 3,
+            "field_count": 110,
+            "parse_ok": True,
+            "parse_warnings": ["late field"],
+            "extra_fields": ["col110=tail"],
+            "raw_line": "M," + ",".join(["0"] * 109),
+            "sd_log_active": True,
+            "sd_state": 2,
+            "sd_error": 0,
+            "debug_mode": False,
+            "current_page": 3,
+            "crash_task": 7,
+            "max_task_stack_hwm": 1000,
+            "ui_task_heartbeat": 9,
+            "ecg_signal_quality": 80,
+            "ecg_peak_snr_x100": 95,
+        }))
+
+        tab = DiagnosticsTab(manager)
+        tab.refresh()
+
+        rows = {}
+        table = tab._system_table
+        self.assertIsNotNone(table)
+        for row in range(table.rowCount()):
+            key_item = table.item(row, 0)
+            value_item = table.item(row, 1)
+            rows[key_item.text()] = value_item.text()
+
+        for key in (
+            "sd_log_active", "sd_state", "sd_error", "debug_mode",
+            "current_page", "crash_task", "max_task_stack_hwm",
+            "ui_task_heartbeat", "raw_line", "extra_fields",
+            "parse_warnings", "ecg_signal_quality", "ecg_peak_snr_x100",
+        ):
+            self.assertIn(key, rows)
+
+        self.assertEqual(rows["sd_log_active"], "True")
+        self.assertEqual(rows["sd_state"], "2")
+        self.assertEqual(rows["crash_task"], "7")
+        self.assertEqual(rows["ecg_signal_quality"], "80")
+        self.assertEqual(rows["ecg_peak_snr_x100"], "95")
+        self.assertEqual(rows["max_task_heartbeat"], "--")
+        self.assertIn("late field", rows["parse_warnings"])
+
+    def test_esp_status_updates_diagnostics_without_entering_data_history(self) -> None:
+        from pulseox_monitor.data_manager import DataManager
+        from pulseox_monitor.models import FlexibleMessage
+        from pulseox_monitor.plot_manager import DiagnosticsTab
+
+        manager = DataManager(max_history=10)
+        tab = DiagnosticsTab(manager)
+        status = FlexibleMessage.from_dict({
+            "message": "esp_status",
+            "online": True,
+            "usb": {"active": True, "connected": True},
+            "mqtt": {"connected": True, "subscribed": True},
+            "wifi": {"connected": True},
+            "transport": {"active": "mqtt"},
+            "esp_stm32_protocol_state": "ok",
+            "esp_stm32_last_frame": "M",
+            "esp_stm32_last_frame_ms": 1234,
+            "protocol_ok": 7,
+            "protocol_error": 1,
+        })
+
+        tab.set_esp_status_message(status)
+
+        rows = {}
+        table = tab._system_table
+        self.assertIsNotNone(table)
+        for row in range(table.rowCount()):
+            key_item = table.item(row, 0)
+            value_item = table.item(row, 1)
+            rows[key_item.text()] = value_item.text()
+
+        self.assertEqual(len(manager), 0)
+        self.assertEqual(rows["esp_online"], "True")
+        self.assertEqual(rows["esp_mqtt_connected"], "True")
+        self.assertEqual(rows["esp_mqtt_subscribed"], "True")
+        self.assertEqual(rows["esp_wifi_connected"], "True")
+        self.assertEqual(rows["esp_stm32_protocol_state"], "ok")
+        self.assertEqual(rows["esp_stm32_last_frame_ms"], "1234")
+        self.assertEqual(rows["protocol_ok"], "7")
+        self.assertEqual(rows["protocol_error"], "1")
